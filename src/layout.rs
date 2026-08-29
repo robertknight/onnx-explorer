@@ -1116,16 +1116,22 @@ mod tests {
         assert_eq!(layout.edges.len(), 1);
     }
 
-    /// A small model named the way exporters name nodes: an embedding, two
-    /// layers, each with an attention and (for the first) an MLP submodule.
+    /// A small model named the way exporters name nodes: an embedding and two
+    /// layers, the first with attention and MLP submodules.
+    ///
+    /// Every block holds at least two nodes, since a block standing for a
+    /// single node is not created.
     fn hierarchical_model() -> Model {
         model(GraphProto {
             node: vec![
-                node("MatMul", "/embed/MatMul", &["x"], &["h0"]),
+                node("MatMul", "/embed/MatMul", &["x"], &["e0"]),
+                node("Add", "/embed/Add", &["e0"], &["h0"]),
                 node("MatMul", "/layers.0/attn/MatMul", &["h0"], &["h1"]),
                 node("Add", "/layers.0/attn/Add", &["h1"], &["h2"]),
-                node("Mul", "/layers.0/mlp/Mul", &["h2"], &["h3"]),
-                node("MatMul", "/layers.1/attn/MatMul", &["h3"], &["y"]),
+                node("Mul", "/layers.0/mlp/Mul", &["h2"], &["m0"]),
+                node("Add", "/layers.0/mlp/Add", &["m0"], &["h3"]),
+                node("MatMul", "/layers.1/attn/MatMul", &["h3"], &["l0"]),
+                node("Add", "/layers.1/attn/Add", &["l0"], &["y"]),
             ],
             input: vec![value_info("x")],
             output: vec![value_info("y")],
@@ -1165,7 +1171,7 @@ mod tests {
 
         // A block's box reports everything nested inside it.
         let layer0 = layout.nodes.iter().find(|n| n.title == "layers.0").unwrap();
-        assert_eq!(layer0.subtitle, "3 nodes");
+        assert_eq!(layer0.subtitle, "4 nodes");
 
         // x -> embed -> layers.0 -> layers.1 -> y. The two edges inside
         // layers.0 are not visible at this level.
@@ -1177,7 +1183,8 @@ mod tests {
         // Two separate values crossing the same block boundary.
         let model = model(GraphProto {
             node: vec![
-                node("Split", "/a/Split", &["x"], &["p", "q"]),
+                node("Identity", "/a/Identity", &["x"], &["x2"]),
+                node("Split", "/a/Split", &["x2"], &["p", "q"]),
                 node("Add", "/b/Add", &["p"], &["r"]),
                 node("Mul", "/b/Mul", &["q"], &["s"]),
             ],
@@ -1261,7 +1268,7 @@ mod tests {
         let model = hierarchical_model();
         let graph = model.root();
         let hierarchy = Hierarchy::build(graph).unwrap();
-        let attn = hierarchy.group_of(graph.nodes()[1].id);
+        let attn = hierarchy.group_of(graph.nodes()[2].id);
 
         let layout = layout_graph(
             graph,

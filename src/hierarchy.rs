@@ -9,6 +9,9 @@
 //! blocks rather than individual operators. Not every model is named this way,
 //! so [`Hierarchy::build`] returns `None` when the names carry no usable
 //! structure and the graph should be shown as plain operators instead.
+//!
+//! Blocks that would hold a single node are not created; see
+//! [`MIN_GROUP_NODES`].
 
 use std::collections::HashMap;
 
@@ -21,6 +24,14 @@ pub struct GroupId(pub u32);
 /// Smallest share of named nodes that must carry a module path before the
 /// hierarchy is considered real rather than incidental.
 const MIN_NAMED_FRACTION: f64 = 0.3;
+
+/// Fewest nodes a block may hold.
+///
+/// A block standing for a single node hides nothing and costs a level of
+/// navigation to see through, so such a node is left in the enclosing block
+/// instead. This cascades: a block holding nothing but a one-node block is
+/// itself down to one node, and is dropped in turn.
+const MIN_GROUP_NODES: usize = 2;
 
 pub struct Group {
     pub parent: Option<GroupId>,
@@ -73,6 +84,11 @@ impl Hierarchy {
         let mut named = 0usize;
         let mut with_path = 0usize;
 
+        // How many nodes fall under each module path, counted before any
+        // group is created so that the ones not worth having can be skipped.
+        let mut population: HashMap<String, usize> = HashMap::new();
+        let mut path = String::new();
+
         for node in graph.nodes() {
             let segments = module_path(&node.name);
 
@@ -85,10 +101,34 @@ impl Hierarchy {
                 }
             }
 
-            let mut current = GroupId(0);
+            path.clear();
             for segment in segments {
+                path.push('/');
+                path.push_str(segment);
+                match population.get_mut(&path) {
+                    Some(count) => *count += 1,
+                    None => {
+                        population.insert(path.clone(), 1);
+                    }
+                }
+            }
+        }
+
+        for node in graph.nodes() {
+            let mut current = GroupId(0);
+            path.clear();
+
+            for segment in module_path(&node.name) {
+                path.push('/');
+                path.push_str(segment);
+                // A path can only lose nodes as it lengthens, so once one is
+                // too sparse to be worth a block, everything below it is too.
+                if population[&path] < MIN_GROUP_NODES {
+                    break;
+                }
                 current = child_group(&mut groups, &mut by_path, current, segment);
             }
+
             groups[current.0 as usize].nodes.push(node.id);
             node_group[node.id.0 as usize] = current;
         }
@@ -249,20 +289,22 @@ mod tests {
             node("MatMul", "/layers.0/attn/MatMul"),
             node("Add", "/layers.0/attn/Add"),
             node("Mul", "/layers.0/mlp/Mul"),
+            node("Add", "/layers.0/mlp/Add"),
             node("MatMul", "/layers.1/attn/MatMul"),
+            node("Add", "/layers.1/attn/Add"),
         ]);
         let hierarchy = Hierarchy::build(model.root()).expect("names are hierarchical");
 
         let root = hierarchy.group(hierarchy.root());
         // `/Shape` belongs to the root; the rest are nested.
         assert_eq!(root.nodes.len(), 1);
-        assert_eq!(root.total_nodes, 5);
+        assert_eq!(root.total_nodes, 7);
         assert_eq!(root.children.len(), 2);
 
         let layers0 = hierarchy.group(root.children[0]);
         assert_eq!(layers0.name, "layers.0");
         assert_eq!(layers0.path, "/layers.0");
-        assert_eq!(layers0.total_nodes, 3);
+        assert_eq!(layers0.total_nodes, 4);
         // Its own nodes all sit in children, not directly in it.
         assert!(layers0.nodes.is_empty());
         assert_eq!(layers0.children.len(), 2);
@@ -280,7 +322,9 @@ mod tests {
         let model = model(vec![
             node("Shape", "/Shape"),
             node("MatMul", "/layers.0/attn/MatMul"),
+            node("Add", "/layers.0/attn/Add"),
             node("Mul", "/layers.1/mlp/Mul"),
+            node("Add", "/layers.1/mlp/Add"),
         ]);
         let graph = model.root();
         let hierarchy = Hierarchy::build(graph).unwrap();
@@ -288,7 +332,7 @@ mod tests {
 
         let top = graph.nodes()[0].id;
         let attn_node = graph.nodes()[1].id;
-        let other_layer = graph.nodes()[2].id;
+        let other_layer = graph.nodes()[3].id;
 
         // From the root, `/Shape` is drawn directly and the rest are folded
         // into their top-level blocks.
@@ -328,6 +372,57 @@ mod tests {
             nodes.push(node("Relu", &format!("relu_{i}")));
         }
         assert!(Hierarchy::build(model(nodes).root()).is_none());
+
+        // Path-like names, but every block would hold a single node, so there
+        // is no grouping left to offer.
+        let singles = model(vec![node("Relu", "/a/Relu"), node("Conv", "/b/Conv")]);
+        assert!(Hierarchy::build(singles.root()).is_none());
+    }
+
+    #[test]
+    fn test_single_node_blocks_are_not_created() {
+        let model = model(vec![
+            node("MatMul", "/layers.0/attn/MatMul"),
+            node("Add", "/layers.0/attn/Add"),
+            node("Mul", "/layers.0/mlp/Mul"),
+        ]);
+        let hierarchy = Hierarchy::build(model.root()).unwrap();
+
+        let layers0 = hierarchy.group(hierarchy.root()).children[0];
+        let children: Vec<&str> = hierarchy
+            .group(layers0)
+            .children
+            .iter()
+            .map(|id| hierarchy.group(*id).name.as_str())
+            .collect();
+
+        // `mlp` holds one node, so it is not worth a block of its own.
+        assert_eq!(children, ["attn"]);
+        // That node is drawn in the enclosing block instead.
+        assert_eq!(hierarchy.group(layers0).nodes.len(), 1);
+        assert_eq!(hierarchy.group_of(model.root().nodes()[2].id), layers0);
+    }
+
+    #[test]
+    fn test_dropping_single_node_blocks_cascades() {
+        let model = model(vec![
+            // The only node under `embed`, so neither `embed` nor `norm` is
+            // worth a block and it rises to the top level.
+            node("Cast", "/embed/norm/Cast"),
+            node("MatMul", "/layers.0/attn/MatMul"),
+            node("Add", "/layers.0/attn/Add"),
+        ]);
+        let hierarchy = Hierarchy::build(model.root()).unwrap();
+        let root = hierarchy.root();
+
+        assert_eq!(hierarchy.group_of(model.root().nodes()[0].id), root);
+        let children: Vec<&str> = hierarchy
+            .group(root)
+            .children
+            .iter()
+            .map(|id| hierarchy.group(*id).name.as_str())
+            .collect();
+        assert_eq!(children, ["layers.0"]);
     }
 
     #[test]
