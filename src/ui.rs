@@ -407,7 +407,7 @@ impl App {
 
             if has_hierarchy {
                 toggled = ui
-                    .checkbox(&mut self.grouped, "Blocks")
+                    .checkbox(&mut self.grouped, "Auto-group nodes")
                     .on_hover_text("Group operators by the structure in their names")
                     .changed();
                 if parent.is_some() {
