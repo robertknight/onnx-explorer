@@ -23,7 +23,7 @@ pub fn run(model: Model, file_name: String) -> eframe::Result<()> {
         ..Default::default()
     };
 
-    let app = App::new(model, file_name);
+    let app = App::new(model);
     eframe::run_native(&title, options, Box::new(move |_cc| Ok(Box::new(app))))
 }
 
@@ -45,7 +45,6 @@ enum Selection {
 
 struct App {
     model: Model,
-    file_name: String,
 
     /// Graph currently being viewed. Changes when entering a subgraph.
     graph: GraphId,
@@ -69,11 +68,10 @@ struct App {
 }
 
 impl App {
-    fn new(model: Model, file_name: String) -> App {
+    fn new(model: Model) -> App {
         let graph = model.root_id();
         let mut app = App {
             model,
-            file_name,
             graph,
             hierarchies: HashMap::new(),
             // Enabled by default wherever the model supports it; this is the
@@ -235,9 +233,6 @@ impl eframe::App for App {
 // Navigation panel.
 impl App {
     fn nav_panel(&mut self, ui: &mut Ui) {
-        ui.add_space(4.0);
-        ui.heading(&self.file_name);
-
         ui.add_space(4.0);
         ui.collapsing("Model", |ui| self.model_info(ui));
 
