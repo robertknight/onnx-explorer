@@ -7,7 +7,9 @@ use egui::{Color32, RichText, TextStyle, Ui};
 
 use crate::canvas::{Canvas, CanvasEvent};
 use crate::layout::{ItemKind, Layout, LayoutOptions, layout_graph};
-use crate::model::{AttrValue, GraphId, Model, NodeId, Tensor, Value, ValueId, ValueKind};
+use crate::model::{
+    AttrValue, GraphId, Model, NodeId, Tensor, TensorData, Value, ValueId, ValueKind,
+};
 use crate::text::{elide, format_count};
 
 pub fn run(model: Model, file_name: String) -> eframe::Result<()> {
@@ -553,6 +555,16 @@ impl App {
                                     ui.label("Size");
                                     ui.label(format!("{} bytes", format_count(bytes as u64)));
                                     ui.end_row();
+                                }
+                                // Weights kept outside the model file describe
+                                // where to find themselves, which is worth
+                                // showing since the data is not in the .onnx.
+                                if let TensorData::External { entries } = &tensor.data {
+                                    for (key, value) in entries {
+                                        ui.label(format!("External {key}"));
+                                        ui.label(value);
+                                        ui.end_row();
+                                    }
                                 }
                             }
                             if let Some(outer) = value.outer {

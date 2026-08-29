@@ -392,19 +392,6 @@ pub enum Dim {
     Unknown,
 }
 
-impl Shape {
-    /// Number of elements, if every dimension is known.
-    pub fn elem_count(&self) -> Option<i64> {
-        self.0
-            .iter()
-            .map(|d| match d {
-                Dim::Fixed(n) => Some(*n),
-                _ => None,
-            })
-            .product()
-    }
-}
-
 impl fmt::Display for Shape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[")?;
@@ -1181,7 +1168,6 @@ mod tests {
             vec![Dim::Param("batch".to_string()), Dim::Fixed(4)]
         );
         assert_eq!(shape.to_string(), "[batch, 4]");
-        assert_eq!(shape.elem_count(), None);
         assert_eq!(x.type_summary(), "FLOAT[batch, 4]");
     }
 

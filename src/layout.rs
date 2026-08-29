@@ -78,7 +78,6 @@ pub struct LayoutEdge {
     /// Index into [`Layout::nodes`].
     pub from: usize,
     pub to: usize,
-    pub value: ValueId,
     /// Polyline from the source node's bottom edge to the target's top edge.
     pub points: Vec<Pos2>,
     /// Bounding box of `points`, for culling.
@@ -729,7 +728,6 @@ fn build_edges(
             LayoutEdge {
                 from: link.from,
                 to: link.to,
-                value: link.value,
                 points,
                 bounds,
                 label: graph.value(link.value).type_summary(),
