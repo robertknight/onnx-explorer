@@ -1,7 +1,14 @@
 # onnx-explorer
 
-A native app for exploring ONNX model graphs. It is like [Netron] but is much
-faster at loading large and complex models.
+A native app for exploring [ONNX](https://onnx.ai/) model graphs. It is like
+[Netron] but is much faster at loading large and complex models.
+
+## Features
+
+ - Visually explore an ONNX model and inspect the attributes of nodes
+ - Loads large models very quickly
+ - Automatically groups nodes into semantic blocks (embedding, head,
+   normalization, attention etc.) using information in node names
 
 ## Building
 
