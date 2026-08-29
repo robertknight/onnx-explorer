@@ -1,0 +1,688 @@
+//! Application shell: a node list on the left, the graph canvas in the middle
+//! and details of the selection on the right.
+
+use std::collections::HashMap;
+
+use egui::{Color32, RichText, TextStyle, Ui};
+
+use crate::canvas::{Canvas, CanvasEvent};
+use crate::layout::{ItemKind, Layout, LayoutOptions, layout_graph};
+use crate::model::{AttrValue, GraphId, Model, NodeId, Tensor, Value, ValueId, ValueKind};
+use crate::text::{elide, format_count};
+
+pub fn run(model: Model, file_name: String) -> eframe::Result<()> {
+    let title = format!("{file_name} — ONNX Explorer");
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([720.0, 480.0])
+            .with_title(&title),
+        ..Default::default()
+    };
+
+    let app = App::new(model, file_name);
+    eframe::run_native(&title, options, Box::new(move |_cc| Ok(Box::new(app))))
+}
+
+/// What the details pane is describing.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Selection {
+    Node(NodeId),
+    Value(ValueId),
+}
+
+struct App {
+    model: Model,
+    file_name: String,
+
+    /// Graph currently being viewed. Changes when entering a subgraph.
+    graph: GraphId,
+    /// Layouts are computed on first view and kept, since they are expensive
+    /// relative to a frame and never change for a given graph.
+    layouts: HashMap<GraphId, Layout>,
+    layout_options: LayoutOptions,
+
+    canvas: Canvas,
+    selection: Option<Selection>,
+    query: String,
+    /// Nodes of the current graph matching `query`, in graph order.
+    matches: Vec<NodeId>,
+}
+
+impl App {
+    fn new(model: Model, file_name: String) -> App {
+        let graph = model.root_id();
+        let mut app = App {
+            model,
+            file_name,
+            graph,
+            layouts: HashMap::new(),
+            layout_options: LayoutOptions::default(),
+            canvas: Canvas::new(),
+            selection: None,
+            query: String::new(),
+            matches: Vec::new(),
+        };
+        app.refresh_matches();
+        app
+    }
+
+    fn ensure_layout(&mut self) {
+        if self.layouts.contains_key(&self.graph) {
+            return;
+        }
+        let layout = layout_graph(self.model.graph(self.graph), &self.layout_options);
+        self.layouts.insert(self.graph, layout);
+    }
+
+    fn refresh_matches(&mut self) {
+        let graph = self.model.graph(self.graph);
+        let query = self.query.trim().to_lowercase();
+        self.matches = graph
+            .nodes()
+            .iter()
+            .filter(|node| {
+                query.is_empty()
+                    || node.name.to_lowercase().contains(&query)
+                    || node.op_type.to_lowercase().contains(&query)
+            })
+            .map(|node| node.id)
+            .collect();
+    }
+
+    fn go_to_graph(&mut self, graph: GraphId) {
+        self.graph = graph;
+        self.selection = None;
+        self.canvas.request_home();
+        self.refresh_matches();
+    }
+
+    /// Select a node, optionally bringing it into view on the canvas.
+    fn select_node(&mut self, id: NodeId, reveal: bool) {
+        self.selection = Some(Selection::Node(id));
+        if !reveal {
+            return;
+        }
+        let rect = self
+            .layouts
+            .get(&self.graph)
+            .and_then(|layout| layout.node_index(id))
+            .map(|index| self.layouts[&self.graph].nodes[index].rect);
+        if let Some(rect) = rect {
+            self.canvas.focus_on(rect);
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ensure_layout();
+
+        egui::Panel::left("nav")
+            .resizable(true)
+            .default_size(320.0)
+            .size_range(220.0..=520.0)
+            .show(ui, |ui| self.nav_panel(ui));
+
+        egui::Panel::right("details")
+            .resizable(true)
+            .default_size(360.0)
+            .size_range(260.0..=640.0)
+            .show(ui, |ui| self.details_panel(ui));
+
+        egui::CentralPanel::default().show(ui, |ui| self.graph_panel(ui));
+    }
+}
+
+// Navigation panel.
+impl App {
+    fn nav_panel(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.heading(&self.file_name);
+
+        ui.add_space(4.0);
+        ui.collapsing("Model", |ui| self.model_info(ui));
+
+        ui.add_space(4.0);
+        self.breadcrumb(ui);
+
+        ui.add_space(4.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.query)
+                .hint_text("Filter by name or op type")
+                .desired_width(f32::INFINITY),
+        );
+        if response.changed() {
+            self.refresh_matches();
+        }
+
+        let total = self.model.graph(self.graph).nodes().len();
+        let shown = self.matches.len();
+        ui.label(
+            RichText::new(if shown == total {
+                format!("{total} nodes")
+            } else {
+                format!("{shown} of {total} nodes")
+            })
+            .weak()
+            .small(),
+        );
+
+        ui.separator();
+        self.node_list(ui);
+    }
+
+    fn model_info(&mut self, ui: &mut Ui) {
+        let model = &self.model;
+        egui::Grid::new("model_info")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                if let Some(producer) = &model.producer_name {
+                    ui.label("Producer");
+                    let version = model.producer_version.as_deref().unwrap_or("");
+                    ui.label(format!("{producer} {version}").trim_end().to_string());
+                    ui.end_row();
+                }
+                if let Some(ir_version) = model.ir_version {
+                    ui.label("IR version");
+                    ui.label(ir_version.to_string());
+                    ui.end_row();
+                }
+                for opset in &model.opset_imports {
+                    ui.label("Opset");
+                    ui.label(match opset.version {
+                        Some(version) => format!("{} v{}", opset.display_domain(), version),
+                        None => opset.display_domain().to_string(),
+                    });
+                    ui.end_row();
+                }
+                ui.label("Graphs");
+                ui.label(model.graph_count().to_string());
+                ui.end_row();
+
+                let params = model.graphs().map(|g| g.parameter_count()).sum::<u64>();
+                ui.label("Parameters");
+                ui.label(format_count(params));
+                ui.end_row();
+
+                for (key, value) in &model.metadata {
+                    ui.label(key);
+                    ui.label(elide(value, 64));
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Path from the root graph to the current one, as clickable links.
+    fn breadcrumb(&mut self, ui: &mut Ui) {
+        let path = self.model.path_to(self.graph);
+        if path.len() < 2 {
+            return;
+        }
+        let mut target = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (i, graph_id) in path.iter().enumerate() {
+                if i > 0 {
+                    ui.label(RichText::new("›").weak());
+                }
+                let label = self.model.graph(*graph_id).label.clone();
+                if i + 1 == path.len() {
+                    ui.label(RichText::new(label).strong());
+                } else if ui.link(label).clicked() {
+                    target = Some(*graph_id);
+                }
+            }
+        });
+        if let Some(graph_id) = target {
+            self.go_to_graph(graph_id);
+        }
+    }
+
+    fn node_list(&mut self, ui: &mut Ui) {
+        let row_height = ui.text_style_height(&TextStyle::Body) + ui.spacing().item_spacing.y;
+        let mut clicked = None;
+
+        // Models routinely have thousands of nodes, so only the visible rows
+        // are laid out.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, self.matches.len(), |ui, range| {
+                let graph = self.model.graph(self.graph);
+                for index in range {
+                    let node_id = self.matches[index];
+                    let node = graph.node(node_id);
+                    let selected = self.selection == Some(Selection::Node(node_id));
+                    let label = format!("{}  {}", node.op_type, node.name);
+                    if ui.selectable_label(selected, elide(&label, 56)).clicked() {
+                        clicked = Some(node_id);
+                    }
+                }
+            });
+
+        if let Some(node_id) = clicked {
+            self.select_node(node_id, true);
+        }
+    }
+}
+
+// Graph canvas.
+impl App {
+    fn graph_panel(&mut self, ui: &mut Ui) {
+        let mut home = false;
+        ui.horizontal(|ui| {
+            ui.strong(&self.model.graph(self.graph).label);
+            ui.separator();
+            home = ui
+                .button("Home")
+                .on_hover_text("Go to the first input, at a legible zoom")
+                .clicked();
+            ui.label(
+                RichText::new(format_zoom(self.canvas.zoom()))
+                    .weak()
+                    .small(),
+            );
+            if self.canvas.is_simplified() {
+                ui.label(
+                    RichText::new("simplified view — zoom in for detail")
+                        .small()
+                        .color(Color32::from_rgb(200, 150, 60)),
+                );
+            }
+        });
+        if home {
+            self.canvas.request_home();
+        }
+        ui.separator();
+
+        // Disjoint field borrows: the canvas is mutated while the layout it
+        // draws is borrowed from the cache.
+        let layout = &self.layouts[&self.graph];
+        let selected_index = match self.selection {
+            Some(Selection::Node(id)) => layout.node_index(id),
+            Some(Selection::Value(id)) => layout
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, ItemKind::Input(v) | ItemKind::Output(v) if v == id)),
+            None => None,
+        };
+        let event = self.canvas.show(ui, layout, selected_index);
+
+        match event {
+            CanvasEvent::Selected(index) => {
+                let selection = match self.layouts[&self.graph].nodes[index].kind {
+                    ItemKind::Op(id) => Selection::Node(id),
+                    ItemKind::Input(id) | ItemKind::Output(id) => Selection::Value(id),
+                };
+                self.selection = Some(selection);
+            }
+            CanvasEvent::Cleared => self.selection = None,
+            CanvasEvent::None => {}
+        }
+    }
+}
+
+// Details panel.
+impl App {
+    fn details_panel(&mut self, ui: &mut Ui) {
+        match self.selection {
+            Some(Selection::Node(id)) => self.node_details(ui, id),
+            Some(Selection::Value(id)) => self.value_details(ui, id),
+            None => self.graph_overview(ui),
+        }
+    }
+
+    fn graph_overview(&mut self, ui: &mut Ui) {
+        let graph = self.model.graph(self.graph);
+        ui.heading(&graph.label);
+        ui.label(RichText::new("Select a node to see its details.").weak());
+        ui.separator();
+
+        let mut goto = None;
+        let mut select = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let graph = self.model.graph(self.graph);
+
+                ui.strong("Inputs");
+                for value_id in &graph.inputs {
+                    let value = graph.value(*value_id);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.link(elide(&value.name, 32)).clicked() {
+                            select = Some(*value_id);
+                        }
+                        ui.label(RichText::new(value.type_summary()).color(type_color(ui)));
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.strong("Outputs");
+                for value_id in &graph.outputs {
+                    let value = graph.value(*value_id);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.link(elide(&value.name, 32)).clicked() {
+                            select = Some(*value_id);
+                        }
+                        ui.label(RichText::new(value.type_summary()).color(type_color(ui)));
+                    });
+                }
+
+                let subgraphs: Vec<_> = graph.subgraphs().collect();
+                if !subgraphs.is_empty() {
+                    ui.add_space(8.0);
+                    ui.strong("Subgraphs");
+                    for (node_id, attr_name, subgraph_id) in subgraphs {
+                        let node = graph.node(node_id);
+                        let label = format!(
+                            "{}.{} ({} nodes)",
+                            node.name,
+                            attr_name,
+                            self.model.graph(subgraph_id).nodes().len()
+                        );
+                        if ui.link(label).clicked() {
+                            goto = Some(subgraph_id);
+                        }
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.strong("Operators");
+                egui::Grid::new("op_counts")
+                    .num_columns(2)
+                    .spacing([16.0, 2.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (op_type, count) in graph.op_type_counts() {
+                            ui.label(op_type);
+                            ui.label(count.to_string());
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if let Some(subgraph_id) = goto {
+            self.go_to_graph(subgraph_id);
+        }
+        if let Some(value_id) = select {
+            self.selection = Some(Selection::Value(value_id));
+        }
+    }
+
+    fn node_details(&mut self, ui: &mut Ui, node_id: NodeId) {
+        let mut goto_node = None;
+        let mut goto_graph = None;
+        let mut clear = false;
+
+        {
+            let graph = self.model.graph(self.graph);
+            let node = graph.node(node_id);
+
+            ui.horizontal(|ui| {
+                ui.heading(node.qualified_op_type());
+                if ui.button("Clear").clicked() {
+                    clear = true;
+                }
+            });
+            ui.label(
+                RichText::new(if node.named {
+                    node.name.clone()
+                } else {
+                    format!("{} (unnamed)", node.name)
+                })
+                .weak(),
+            );
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.strong("Inputs");
+                    ui.add_space(2.0);
+                    for (index, value_id) in node.inputs.iter().enumerate() {
+                        match value_id {
+                            Some(value_id) => {
+                                let value = graph.value(*value_id);
+                                let constant = graph.constant_tensor(value);
+                                if let Some(target) = value_row(ui, index, value, constant, true) {
+                                    goto_node = Some(target);
+                                }
+                            }
+                            None => {
+                                ui.label(RichText::new(format!("{index}.  (omitted)")).weak());
+                            }
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.strong("Outputs");
+                    ui.add_space(2.0);
+                    for (index, value_id) in node.outputs.iter().enumerate() {
+                        match value_id {
+                            Some(value_id) => {
+                                let value = graph.value(*value_id);
+                                let constant = graph.constant_tensor(value);
+                                if let Some(target) = value_row(ui, index, value, constant, false) {
+                                    goto_node = Some(target);
+                                }
+                            }
+                            None => {
+                                ui.label(RichText::new(format!("{index}.  (omitted)")).weak());
+                            }
+                        }
+                    }
+
+                    if !node.attrs.is_empty() {
+                        ui.add_space(10.0);
+                        ui.strong("Attributes");
+                        ui.add_space(2.0);
+                        egui::Grid::new("attrs")
+                            .num_columns(3)
+                            .spacing([12.0, 3.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for attr in &node.attrs {
+                                    ui.monospace(&attr.name);
+                                    ui.label(RichText::new(attr.value.type_name()).weak());
+                                    match attr.value {
+                                        AttrValue::Graph(subgraph_id) => {
+                                            let count =
+                                                self.model.graph(subgraph_id).nodes().len();
+                                            if ui.link(format!("open ({count} nodes)")).clicked() {
+                                                goto_graph = Some(subgraph_id);
+                                            }
+                                        }
+                                        _ => {
+                                            ui.label(elide(&attr.value.to_string(), 72));
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                });
+        }
+
+        if clear {
+            self.selection = None;
+        }
+        if let Some(target) = goto_node {
+            self.select_node(target, true);
+        }
+        if let Some(graph_id) = goto_graph {
+            self.go_to_graph(graph_id);
+        }
+    }
+
+    fn value_details(&mut self, ui: &mut Ui, value_id: ValueId) {
+        let mut goto_node = None;
+        let mut clear = false;
+
+        {
+            let graph = self.model.graph(self.graph);
+            let value = graph.value(value_id);
+
+            ui.horizontal(|ui| {
+                ui.heading(elide(&value.name, 28));
+                if ui.button("Clear").clicked() {
+                    clear = true;
+                }
+            });
+            ui.label(RichText::new(value.kind.label()).weak());
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("value_info")
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("Name");
+                            ui.monospace(&value.name);
+                            ui.end_row();
+                            ui.label("Type");
+                            ui.label(value.type_summary());
+                            ui.end_row();
+                            if let Some(tensor) = graph.constant_tensor(value) {
+                                ui.label("Elements");
+                                ui.label(format_count(tensor.elem_count()));
+                                ui.end_row();
+                                if let Some(bytes) = tensor.byte_len() {
+                                    ui.label("Size");
+                                    ui.label(format!("{} bytes", format_count(bytes as u64)));
+                                    ui.end_row();
+                                }
+                            }
+                            if let Some(outer) = value.outer {
+                                ui.label("Defined in");
+                                ui.label(&self.model.graph(outer.graph).label);
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.add_space(10.0);
+                    ui.strong("Producer");
+                    match value.producer {
+                        Some(producer) => {
+                            let node = graph.node(producer);
+                            if ui
+                                .link(format!("{}  {}", node.op_type, elide(&node.name, 28)))
+                                .clicked()
+                            {
+                                goto_node = Some(producer);
+                            }
+                        }
+                        None => {
+                            ui.label(RichText::new("none").weak());
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.strong(format!("Consumers ({})", value.consumers.len()));
+                    for consumer in &value.consumers {
+                        let node = graph.node(*consumer);
+                        if ui
+                            .link(format!("{}  {}", node.op_type, elide(&node.name, 28)))
+                            .clicked()
+                        {
+                            goto_node = Some(*consumer);
+                        }
+                    }
+                });
+        }
+
+        if clear {
+            self.selection = None;
+        }
+        if let Some(target) = goto_node {
+            self.select_node(target, true);
+        }
+    }
+}
+
+/// Colour for tensor types and shapes in the details pane.
+///
+/// egui's `weak` colour is too low-contrast to read comfortably at this size.
+/// Using the normal text colour keeps these legible, and does the right thing
+/// in both themes: darker against a light background, brighter against a dark
+/// one.
+fn type_color(ui: &Ui) -> Color32 {
+    ui.visuals().text_color()
+}
+
+/// Format the zoom level, keeping it meaningful when a very large graph is
+/// fitted to the window and the scale falls well below one percent.
+fn format_zoom(zoom: f32) -> String {
+    let percent = zoom * 100.0;
+    if percent >= 10.0 {
+        format!("{percent:.0}%")
+    } else if percent >= 1.0 {
+        format!("{percent:.1}%")
+    } else {
+        format!("{percent:.3}%")
+    }
+}
+
+/// Render one input or output row. Returns a node to navigate to if the user
+/// clicked a link to the value's producer or consumer.
+fn value_row(
+    ui: &mut Ui,
+    index: usize,
+    value: &Value,
+    constant: Option<&Tensor>,
+    is_input: bool,
+) -> Option<NodeId> {
+    let mut target = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new(format!("{index}.")).weak().monospace());
+        ui.monospace(elide(&value.name, 36));
+        ui.label(RichText::new(value.type_summary()).color(type_color(ui)));
+
+        match value.kind {
+            ValueKind::Initializer | ValueKind::Constant => {
+                let params = constant
+                    .map(|t| format_count(t.elem_count()))
+                    .unwrap_or_default();
+                ui.label(RichText::new(format!("const · {params}")).color(Color32::GRAY));
+            }
+            ValueKind::OuterScope => {
+                ui.label(RichText::new("outer scope").color(Color32::GRAY));
+            }
+            _ => {
+                // Offer a jump to the node on the other end of this edge.
+                if is_input {
+                    if let Some(producer) = value.producer {
+                        if ui.link("← producer").clicked() {
+                            target = Some(producer);
+                        }
+                    } else {
+                        ui.label(RichText::new(value.kind.label()).color(Color32::GRAY));
+                    }
+                } else {
+                    match value.consumers.len() {
+                        0 => {
+                            ui.label(RichText::new(value.kind.label()).color(Color32::GRAY));
+                        }
+                        1 => {
+                            if ui.link("consumer →").clicked() {
+                                target = Some(value.consumers[0]);
+                            }
+                        }
+                        n => {
+                            ui.label(RichText::new(format!("{n} consumers")).weak());
+                            for consumer in &value.consumers {
+                                if ui.link("→").clicked() {
+                                    target = Some(*consumer);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    target
+}
