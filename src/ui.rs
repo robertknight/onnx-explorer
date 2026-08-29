@@ -247,24 +247,25 @@ impl App {
         ui.add_space(4.0);
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.query)
-                .hint_text("Filter by name or op type")
+                .hint_text("Filter by name or op type  (/)")
                 .desired_width(f32::INFINITY),
         );
         if response.changed() {
             self.refresh_matches();
         }
 
-        let total = self.model.graph(self.graph).nodes().len();
-        let shown = self.matches.len();
-        ui.label(
-            RichText::new(if shown == total {
-                format!("{total} nodes")
-            } else {
-                format!("{shown} of {total} nodes")
-            })
-            .weak()
-            .small(),
-        );
+        // "/" jumps to the filter, as in a pager. The key is consumed so it is
+        // not typed into the box, and ignored while the box already has focus
+        // so that a slash can still be searched for.
+        if !response.has_focus() {
+            let pressed = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Slash)
+                    || input.consume_key(egui::Modifiers::SHIFT, egui::Key::Slash)
+            });
+            if pressed {
+                response.request_focus();
+            }
+        }
 
         ui.separator();
         self.node_list(ui);
