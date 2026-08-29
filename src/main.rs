@@ -1,6 +1,7 @@
 //! Native viewer for ONNX model graphs.
 
 mod canvas;
+mod hierarchy;
 mod layout;
 mod model;
 mod text;
@@ -112,7 +113,7 @@ fn print_layout_timings(model: &Model, file_name: &str, load_time: std::time::Du
 
     for graph in model.graphs() {
         let start = Instant::now();
-        let layout = layout_graph(graph, &opts);
+        let layout = layout_graph(graph, None, &opts);
         let elapsed = start.elapsed();
         total += elapsed;
 
@@ -131,6 +132,24 @@ fn print_layout_timings(model: &Model, file_name: &str, load_time: std::time::Du
     }
 
     println!("  total layout: {:.1} ms", total.as_secs_f64() * 1000.0);
+
+    // The grouped view of the main graph, which is what opens by default when
+    // node names carry structure.
+    if let Some(hierarchy) = crate::hierarchy::Hierarchy::build(model.root()) {
+        let scope = crate::layout::Scope {
+            hierarchy: &hierarchy,
+            group: hierarchy.root(),
+        };
+        let start = Instant::now();
+        let layout = layout_graph(model.root(), Some(scope), &opts);
+        println!(
+            "  grouped top level:   {} blocks -> {} boxes, {} edges, {:.1} ms",
+            hierarchy.group(hierarchy.root()).children.len(),
+            layout.nodes.len(),
+            layout.edges.len(),
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
 }
 
 /// Print an overview of the model, for use from the terminal and as a way to
@@ -154,6 +173,13 @@ fn print_summary(model: &Model, file_name: &str, load_time: std::time::Duration)
 
     let root = model.root();
     println!("  graphs:     {}", model.graph_count());
+    match crate::hierarchy::Hierarchy::build(root) {
+        Some(hierarchy) => println!(
+            "  blocks:     {} from node names",
+            hierarchy.group_count() - 1
+        ),
+        None => println!("  blocks:     none, node names are not hierarchical"),
+    }
     println!(
         "  nodes:      {} in the main graph, {} in total",
         root.nodes().len(),

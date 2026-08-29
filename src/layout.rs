@@ -10,11 +10,12 @@
 //! and are drawn as polylines rather than crossing arbitrarily through the
 //! drawing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use egui::{Pos2, Rect, Vec2, pos2, vec2};
 
-use crate::model::{Graph, NodeId, ValueId};
+use crate::hierarchy::{GroupId, Hierarchy, Placement};
+use crate::model::{Graph, NodeId, Value, ValueId};
 
 pub struct LayoutOptions {
     pub node_height: f32,
@@ -59,10 +60,22 @@ impl Default for LayoutOptions {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ItemKind {
     Op(NodeId),
-    /// A declared input of the graph.
+    /// A block of nodes, standing in for everything inside it. Entering the
+    /// group replaces the box with its contents.
+    Group(GroupId),
+    /// A value entering the view: a declared graph input, or a value produced
+    /// outside the current scope.
     Input(ValueId),
-    /// A declared output of the graph.
+    /// A value leaving the view: a declared graph output, or a value read
+    /// outside the current scope.
     Output(ValueId),
+}
+
+/// The part of the model being drawn, when nodes are grouped by name.
+#[derive(Copy, Clone)]
+pub struct Scope<'a> {
+    pub hierarchy: &'a Hierarchy,
+    pub group: GroupId,
 }
 
 pub struct LayoutNode {
@@ -94,14 +107,21 @@ pub struct Layout {
     /// Dummy nodes created for edge routing, reported for diagnostics.
     pub dummy_count: usize,
     node_by_id: HashMap<NodeId, usize>,
+    group_by_id: HashMap<GroupId, usize>,
     /// Edge indices incident to each node, for highlighting a selection.
     incident: Vec<Vec<usize>>,
 }
 
 impl Layout {
-    /// Index of the drawn box for `id`, absent if the node was folded away.
+    /// Index of the drawn box for `id`, absent if the node was folded away or
+    /// lies outside the current scope.
     pub fn node_index(&self, id: NodeId) -> Option<usize> {
         self.node_by_id.get(&id).copied()
+    }
+
+    /// Index of the drawn box standing in for a group.
+    pub fn group_index(&self, id: GroupId) -> Option<usize> {
+        self.group_by_id.get(&id).copied()
     }
 
     pub fn incident_edges(&self, node: usize) -> &[usize] {
@@ -142,9 +162,14 @@ struct Cell {
     item: Option<usize>,
 }
 
-pub fn layout_graph(graph: &Graph, opts: &LayoutOptions) -> Layout {
-    let (mut nodes, node_by_id, input_by_value, output_by_value) = collect_items(graph, opts);
-    let links = collect_links(graph, &node_by_id, &input_by_value, &output_by_value);
+pub fn layout_graph(graph: &Graph, scope: Option<Scope>, opts: &LayoutOptions) -> Layout {
+    let collected = collect(graph, scope, opts);
+    let Collected {
+        mut nodes,
+        node_by_id,
+        group_by_id,
+        links,
+    } = collected;
 
     let ranks = assign_ranks(nodes.len(), &links);
 
@@ -196,6 +221,7 @@ pub fn layout_graph(graph: &Graph, opts: &LayoutOptions) -> Layout {
         rank_count: rank_y.len(),
         dummy_count: cells.iter().filter(|c| c.item.is_none()).count(),
         node_by_id,
+        group_by_id,
         incident,
     }
 }
@@ -207,123 +233,261 @@ struct Link {
     value: ValueId,
 }
 
-type ItemMaps = (
-    Vec<LayoutNode>,
-    HashMap<NodeId, usize>,
-    HashMap<ValueId, usize>,
-    HashMap<ValueId, usize>,
-);
+struct Collected {
+    nodes: Vec<LayoutNode>,
+    node_by_id: HashMap<NodeId, usize>,
+    group_by_id: HashMap<GroupId, usize>,
+    links: Vec<Link>,
+}
 
-/// Choose which boxes to draw: graph inputs, operators, and graph outputs.
+/// Choose which boxes to draw and how they connect.
 ///
-/// Constants are not drawn. A large model has hundreds of them and they carry
-/// no structure; they are shown in the details pane of the node that reads
+/// Without a scope this is every operator in the graph, plus a box for each
+/// declared input and output. With a scope, the operators directly inside it
+/// are drawn alongside one box per child group, and values crossing the
+/// scope's boundary get input and output boxes so the view still shows what
+/// flows in and out.
+///
+/// Constants are never drawn. A large model has hundreds of them and they
+/// carry no structure; they appear in the details pane of the node that reads
 /// them instead.
-fn collect_items(graph: &Graph, opts: &LayoutOptions) -> ItemMaps {
-    let mut nodes = Vec::new();
-    let mut node_by_id = HashMap::new();
-    let mut input_by_value = HashMap::new();
-    let mut output_by_value = HashMap::new();
+fn collect<'a>(graph: &'a Graph, scope: Option<Scope<'a>>, opts: &LayoutOptions) -> Collected {
+    let mut builder = Collector {
+        graph,
+        scope,
+        opts,
+        nodes: Vec::new(),
+        node_by_id: HashMap::new(),
+        group_by_id: HashMap::new(),
+        input_by_value: HashMap::new(),
+        output_by_value: HashMap::new(),
+        links: Vec::new(),
+        seen_group_links: HashSet::new(),
+    };
+    builder.collect_boxes();
+    builder.collect_links();
 
-    let push = |nodes: &mut Vec<LayoutNode>, kind, title: String, subtitle: String| {
-        let width = (title.chars().count() as f32 * opts.char_width + 28.0)
-            .clamp(opts.min_node_width, opts.max_node_width);
-        let index = nodes.len();
-        nodes.push(LayoutNode {
+    Collected {
+        nodes: builder.nodes,
+        node_by_id: builder.node_by_id,
+        group_by_id: builder.group_by_id,
+        links: builder.links,
+    }
+}
+
+struct Collector<'a> {
+    graph: &'a Graph,
+    scope: Option<Scope<'a>>,
+    opts: &'a LayoutOptions,
+    nodes: Vec<LayoutNode>,
+    node_by_id: HashMap<NodeId, usize>,
+    group_by_id: HashMap<GroupId, usize>,
+    input_by_value: HashMap<ValueId, usize>,
+    output_by_value: HashMap<ValueId, usize>,
+    links: Vec<Link>,
+    /// Links already drawn between a pair of boxes where one is a group.
+    /// Aggregating a block's edges otherwise produces a bundle of identical
+    /// lines between the same two boxes.
+    seen_group_links: HashSet<(usize, usize)>,
+}
+
+impl<'a> Collector<'a> {
+    /// Whether the view covers the whole graph, so declared inputs and outputs
+    /// are shown whether or not anything uses them.
+    fn at_top_level(&self) -> bool {
+        match self.scope {
+            Some(scope) => scope.group == scope.hierarchy.root(),
+            None => true,
+        }
+    }
+
+    fn push(&mut self, kind: ItemKind, title: String, subtitle: String) -> usize {
+        let width = (title.chars().count() as f32 * self.opts.char_width + 28.0)
+            .clamp(self.opts.min_node_width, self.opts.max_node_width);
+        let index = self.nodes.len();
+        self.nodes.push(LayoutNode {
             kind,
-            rect: Rect::from_min_size(Pos2::ZERO, vec2(width, opts.node_height)),
+            rect: Rect::from_min_size(Pos2::ZERO, vec2(width, self.opts.node_height)),
             title,
             subtitle,
         });
         index
-    };
-
-    for value_id in &graph.inputs {
-        let value = graph.value(*value_id);
-        if value.is_constant() {
-            continue;
-        }
-        let index = push(
-            &mut nodes,
-            ItemKind::Input(*value_id),
-            value.name.clone(),
-            value.type_summary(),
-        );
-        input_by_value.insert(*value_id, index);
     }
 
-    for node in graph.nodes() {
+    fn collect_boxes(&mut self) {
+        if self.at_top_level() {
+            for value_id in &self.graph.inputs {
+                let value = self.graph.value(*value_id);
+                if value.is_constant() {
+                    continue;
+                }
+                let index = self.push(
+                    ItemKind::Input(*value_id),
+                    value.name.clone(),
+                    value.type_summary(),
+                );
+                self.input_by_value.insert(*value_id, index);
+            }
+        }
+
+        match self.scope {
+            Some(scope) => {
+                let group = scope.hierarchy.group(scope.group);
+                for child in &group.children {
+                    let child_group = scope.hierarchy.group(*child);
+                    let count = child_group.total_nodes;
+                    let index = self.push(
+                        ItemKind::Group(*child),
+                        child_group.name.clone(),
+                        format!("{count} nodes"),
+                    );
+                    self.group_by_id.insert(*child, index);
+                }
+                for node_id in &group.nodes {
+                    self.push_op(*node_id);
+                }
+            }
+            None => {
+                for node in self.graph.nodes() {
+                    self.push_op(node.id);
+                }
+            }
+        }
+
+        if self.at_top_level() {
+            for value_id in &self.graph.outputs {
+                let value = self.graph.value(*value_id);
+                let index = self.push(
+                    ItemKind::Output(*value_id),
+                    value.name.clone(),
+                    value.type_summary(),
+                );
+                self.output_by_value.insert(*value_id, index);
+            }
+        }
+    }
+
+    fn push_op(&mut self, node_id: NodeId) {
+        let node = self.graph.node(node_id);
         if node.is_constant() {
-            continue;
+            return;
         }
-        let index = push(
-            &mut nodes,
-            ItemKind::Op(node.id),
-            node.op_type.clone(),
-            node.name.clone(),
-        );
-        node_by_id.insert(node.id, index);
+        let (op_type, name) = (node.op_type.clone(), node.name.clone());
+        let index = self.push(ItemKind::Op(node_id), op_type, name);
+        self.node_by_id.insert(node_id, index);
     }
 
-    for value_id in &graph.outputs {
-        let value = graph.value(*value_id);
-        let index = push(
-            &mut nodes,
-            ItemKind::Output(*value_id),
+    /// Locate a node relative to the current scope.
+    fn placement(&self, node: NodeId) -> Placement {
+        match self.scope {
+            Some(scope) => scope.hierarchy.placement(scope.group, node),
+            None => Placement::Direct,
+        }
+    }
+
+    /// The visible box standing in for a node, if it has one.
+    fn box_for(&self, node: NodeId) -> Option<usize> {
+        match self.placement(node) {
+            Placement::Direct => self.node_by_id.get(&node).copied(),
+            Placement::Within(group) => self.group_by_id.get(&group).copied(),
+            Placement::Outside => None,
+        }
+    }
+
+    fn collect_links(&mut self) {
+        let graph_outputs: HashSet<ValueId> = self.graph.outputs.iter().copied().collect();
+
+        for value in self.graph.values() {
+            if value.is_constant() {
+                continue;
+            }
+
+            // Consumers visible here, and whether the value is also read
+            // somewhere outside this scope.
+            let mut targets = Vec::new();
+            let mut escapes = false;
+            for consumer in &value.consumers {
+                match self.placement(*consumer) {
+                    Placement::Outside => escapes = true,
+                    _ => {
+                        if let Some(index) = self.box_for(*consumer) {
+                            targets.push(index);
+                        }
+                    }
+                }
+            }
+            targets.sort_unstable();
+            targets.dedup();
+
+            let source = match value.producer {
+                Some(producer) => self.box_for(producer),
+                // No producer: a declared graph input, or a value inherited
+                // from an enclosing graph.
+                None => self.input_by_value.get(&value.id).copied(),
+            };
+
+            let leaves = escapes || graph_outputs.contains(&value.id);
+            let source = match source {
+                Some(index) => index,
+                None => {
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    self.boundary_input(value)
+                }
+            };
+
+            for target in targets {
+                self.link(source, target, value.id);
+            }
+
+            if leaves {
+                let target = self.boundary_output(value);
+                self.link(source, target, value.id);
+            }
+        }
+    }
+
+    /// Box for a value arriving from outside the current scope.
+    fn boundary_input(&mut self, value: &Value) -> usize {
+        if let Some(index) = self.input_by_value.get(&value.id) {
+            return *index;
+        }
+        let index = self.push(
+            ItemKind::Input(value.id),
             value.name.clone(),
             value.type_summary(),
         );
-        output_by_value.insert(*value_id, index);
+        self.input_by_value.insert(value.id, index);
+        index
     }
 
-    (nodes, node_by_id, input_by_value, output_by_value)
-}
-
-fn collect_links(
-    graph: &Graph,
-    node_by_id: &HashMap<NodeId, usize>,
-    input_by_value: &HashMap<ValueId, usize>,
-    output_by_value: &HashMap<ValueId, usize>,
-) -> Vec<Link> {
-    let mut links = Vec::new();
-
-    for value in graph.values() {
-        if value.is_constant() {
-            continue;
+    /// Box for a value leaving the current scope.
+    fn boundary_output(&mut self, value: &Value) -> usize {
+        if let Some(index) = self.output_by_value.get(&value.id) {
+            return *index;
         }
-
-        // A value flows from whichever box defines it: the node that produces
-        // it, or the box drawn for a graph input.
-        let source = value
-            .producer
-            .and_then(|id| node_by_id.get(&id).copied())
-            .or_else(|| input_by_value.get(&value.id).copied());
-        let Some(source) = source else {
-            continue;
-        };
-
-        for consumer in &value.consumers {
-            if let Some(target) = node_by_id.get(consumer).copied() {
-                links.push(Link {
-                    from: source,
-                    to: target,
-                    value: value.id,
-                });
-            }
-        }
-
-        if let Some(target) = output_by_value.get(&value.id).copied() {
-            if target != source {
-                links.push(Link {
-                    from: source,
-                    to: target,
-                    value: value.id,
-                });
-            }
-        }
+        let index = self.push(
+            ItemKind::Output(value.id),
+            value.name.clone(),
+            value.type_summary(),
+        );
+        self.output_by_value.insert(value.id, index);
+        index
     }
 
-    links
+    fn link(&mut self, from: usize, to: usize, value: ValueId) {
+        // An edge wholly inside one group is not visible at this level.
+        if from == to {
+            return;
+        }
+        let involves_group = matches!(self.nodes[from].kind, ItemKind::Group(_))
+            || matches!(self.nodes[to].kind, ItemKind::Group(_));
+        if involves_group && !self.seen_group_links.insert((from, to)) {
+            return;
+        }
+        self.links.push(Link { from, to, value });
+    }
 }
 
 /// Assign each box to a rank, so that every edge points downwards.
@@ -760,7 +924,8 @@ fn bounds_of(nodes: &[LayoutNode], edges: &[LayoutEdge]) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{isotonic, LayoutOptions, ItemKind, layout_graph};
+    use super::{isotonic, ItemKind, LayoutOptions, Scope, layout_graph};
+    use crate::hierarchy::Hierarchy;
     use crate::model::Model;
     use rten_onnx::onnx::{GraphProto, ModelProto, NodeProto, ValueInfoProto};
 
@@ -824,7 +989,7 @@ mod tests {
             ..Default::default()
         });
 
-        let layout = layout_graph(model.root(), &LayoutOptions::default());
+        let layout = layout_graph(model.root(), None, &LayoutOptions::default());
 
         // One box per operator, plus the graph input and output.
         assert_eq!(layout.nodes.len(), 5);
@@ -865,7 +1030,7 @@ mod tests {
         });
 
         let opts = LayoutOptions::default();
-        let layout = layout_graph(model.root(), &opts);
+        let layout = layout_graph(model.root(), None, &opts);
 
         let mut leaves: Vec<_> = layout
             .nodes
@@ -899,7 +1064,7 @@ mod tests {
             ..Default::default()
         });
 
-        let layout = layout_graph(model.root(), &LayoutOptions::default());
+        let layout = layout_graph(model.root(), None, &LayoutOptions::default());
         let skip = layout
             .edges
             .iter()
@@ -938,7 +1103,7 @@ mod tests {
             ..Default::default()
         });
 
-        let layout = layout_graph(model.root(), &LayoutOptions::default());
+        let layout = layout_graph(model.root(), None, &LayoutOptions::default());
         assert!(
             layout
                 .nodes
@@ -951,9 +1116,188 @@ mod tests {
         assert_eq!(layout.edges.len(), 1);
     }
 
+    /// A small model named the way exporters name nodes: an embedding, two
+    /// layers, each with an attention and (for the first) an MLP submodule.
+    fn hierarchical_model() -> Model {
+        model(GraphProto {
+            node: vec![
+                node("MatMul", "/embed/MatMul", &["x"], &["h0"]),
+                node("MatMul", "/layers.0/attn/MatMul", &["h0"], &["h1"]),
+                node("Add", "/layers.0/attn/Add", &["h1"], &["h2"]),
+                node("Mul", "/layers.0/mlp/Mul", &["h2"], &["h3"]),
+                node("MatMul", "/layers.1/attn/MatMul", &["h3"], &["y"]),
+            ],
+            input: vec![value_info("x")],
+            output: vec![value_info("y")],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_top_level_draws_blocks_not_operators() {
+        let model = hierarchical_model();
+        let graph = model.root();
+        let hierarchy = Hierarchy::build(graph).unwrap();
+        let scope = Scope {
+            hierarchy: &hierarchy,
+            group: hierarchy.root(),
+        };
+
+        let layout = layout_graph(graph, Some(scope), &LayoutOptions::default());
+
+        // The graph input and output, plus one box per top-level block.
+        let groups: Vec<&str> = layout
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ItemKind::Group(_)))
+            .map(|n| n.title.as_str())
+            .collect();
+        assert_eq!(groups, ["embed", "layers.0", "layers.1"]);
+        assert_eq!(layout.nodes.len(), 5);
+
+        // No operator is drawn directly: they are all inside a block.
+        assert!(
+            !layout
+                .nodes
+                .iter()
+                .any(|n| matches!(n.kind, ItemKind::Op(_)))
+        );
+
+        // A block's box reports everything nested inside it.
+        let layer0 = layout
+            .nodes
+            .iter()
+            .find(|n| n.title == "layers.0")
+            .unwrap();
+        assert_eq!(layer0.subtitle, "3 nodes");
+
+        // x -> embed -> layers.0 -> layers.1 -> y. The two edges inside
+        // layers.0 are not visible at this level.
+        assert_eq!(layout.edges.len(), 4);
+    }
+
+    #[test]
+    fn test_blocks_aggregate_parallel_edges_into_one() {
+        // Two separate values crossing the same block boundary.
+        let model = model(GraphProto {
+            node: vec![
+                node("Split", "/a/Split", &["x"], &["p", "q"]),
+                node("Add", "/b/Add", &["p"], &["r"]),
+                node("Mul", "/b/Mul", &["q"], &["s"]),
+            ],
+            input: vec![value_info("x")],
+            ..Default::default()
+        });
+        let graph = model.root();
+        let hierarchy = Hierarchy::build(graph).unwrap();
+        let scope = Scope {
+            hierarchy: &hierarchy,
+            group: hierarchy.root(),
+        };
+
+        let layout = layout_graph(graph, Some(scope), &LayoutOptions::default());
+
+        // `p` and `q` both run from block `a` to block `b`, but a bundle of
+        // identical lines between the same two boxes says nothing extra.
+        let a_to_b = layout
+            .edges
+            .iter()
+            .filter(|e| layout.nodes[e.from].title == "a" && layout.nodes[e.to].title == "b")
+            .count();
+        assert_eq!(a_to_b, 1);
+    }
+
+    #[test]
+    fn test_entering_a_block_shows_its_contents_and_boundary() {
+        let model = hierarchical_model();
+        let graph = model.root();
+        let hierarchy = Hierarchy::build(graph).unwrap();
+
+        let root = hierarchy.group(hierarchy.root());
+        let layer0 = *root
+            .children
+            .iter()
+            .find(|id| hierarchy.group(**id).name == "layers.0")
+            .unwrap();
+
+        let layout = layout_graph(
+            graph,
+            Some(Scope {
+                hierarchy: &hierarchy,
+                group: layer0,
+            }),
+            &LayoutOptions::default(),
+        );
+
+        // Its two submodules, drawn as blocks.
+        let groups: Vec<&str> = layout
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ItemKind::Group(_)))
+            .map(|n| n.title.as_str())
+            .collect();
+        assert_eq!(groups, ["attn", "mlp"]);
+
+        // The value arriving from the embedding, and the one leaving for the
+        // next layer, are drawn so the view shows what crosses the boundary.
+        let inputs: Vec<&str> = layout
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ItemKind::Input(_)))
+            .map(|n| n.title.as_str())
+            .collect();
+        let outputs: Vec<&str> = layout
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ItemKind::Output(_)))
+            .map(|n| n.title.as_str())
+            .collect();
+        assert_eq!(inputs, ["h0"]);
+        assert_eq!(outputs, ["h3"]);
+
+        // h0 -> attn, attn -> mlp, mlp -> h3. The edge wholly inside attn is
+        // not visible here.
+        assert_eq!(layout.edges.len(), 3);
+    }
+
+    #[test]
+    fn test_deepest_block_shows_operators() {
+        let model = hierarchical_model();
+        let graph = model.root();
+        let hierarchy = Hierarchy::build(graph).unwrap();
+        let attn = hierarchy.group_of(graph.nodes()[1].id);
+
+        let layout = layout_graph(
+            graph,
+            Some(Scope {
+                hierarchy: &hierarchy,
+                group: attn,
+            }),
+            &LayoutOptions::default(),
+        );
+
+        let ops: Vec<&str> = layout
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ItemKind::Op(_)))
+            .map(|n| n.title.as_str())
+            .collect();
+        assert_eq!(ops, ["MatMul", "Add"]);
+        assert!(
+            !layout
+                .nodes
+                .iter()
+                .any(|n| matches!(n.kind, ItemKind::Group(_)))
+        );
+    }
+
     #[test]
     fn test_empty_graph() {
-        let layout = layout_graph(model(GraphProto::default()).root(), &LayoutOptions::default());
+        let layout = layout_graph(
+            model(GraphProto::default()).root(),
+            None,
+            &LayoutOptions::default(),
+        );
         assert!(layout.nodes.is_empty());
         assert!(layout.edges.is_empty());
     }

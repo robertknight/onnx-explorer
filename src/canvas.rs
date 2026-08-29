@@ -510,6 +510,7 @@ fn arrow_head(painter: &egui::Painter, tip: Pos2, from: Pos2, size: f32, color: 
 struct Palette {
     background: Color32,
     node_fill: Color32,
+    group_fill: Color32,
     node_stroke: Color32,
     input_fill: Color32,
     output_fill: Color32,
@@ -528,6 +529,7 @@ impl Palette {
             Palette {
                 background: Color32::from_rgb(24, 24, 28),
                 node_fill: Color32::from_rgb(46, 46, 54),
+                group_fill: Color32::from_rgb(58, 52, 74),
                 node_stroke: Color32::from_rgb(84, 84, 96),
                 input_fill: Color32::from_rgb(32, 62, 50),
                 output_fill: Color32::from_rgb(34, 50, 76),
@@ -543,6 +545,7 @@ impl Palette {
             Palette {
                 background: Color32::from_rgb(250, 250, 252),
                 node_fill: Color32::from_rgb(255, 255, 255),
+                group_fill: Color32::from_rgb(240, 234, 250),
                 node_stroke: Color32::from_rgb(188, 188, 200),
                 input_fill: Color32::from_rgb(226, 244, 234),
                 output_fill: Color32::from_rgb(224, 236, 252),
@@ -563,6 +566,7 @@ impl Palette {
         }
         match kind {
             ItemKind::Op(_) => self.node_fill,
+            ItemKind::Group(_) => self.group_fill,
             ItemKind::Input(_) => self.input_fill,
             ItemKind::Output(_) => self.output_fill,
         }

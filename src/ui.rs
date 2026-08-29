@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use egui::{Color32, RichText, TextStyle, Ui};
 
 use crate::canvas::{Canvas, CanvasEvent};
-use crate::layout::{ItemKind, Layout, LayoutOptions, layout_graph};
+use crate::hierarchy::{GroupId, Hierarchy};
+use crate::layout::{ItemKind, Layout, LayoutOptions, Scope, layout_graph};
 use crate::model::{
-    AttrValue, GraphId, Model, NodeId, Tensor, TensorData, Value, ValueId, ValueKind,
+    AttrValue, Graph, GraphId, Model, NodeId, Tensor, TensorData, Value, ValueId, ValueKind,
 };
 use crate::text::{elide, format_count};
 
@@ -26,6 +27,15 @@ pub fn run(model: Model, file_name: String) -> eframe::Result<()> {
     eframe::run_native(&title, options, Box::new(move |_cc| Ok(Box::new(app))))
 }
 
+/// Identifies one drawing: a graph, and the block within it that is open.
+/// Layouts are cached against this, since a graph laid out at two different
+/// levels of its hierarchy is two different drawings.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+struct ViewKey {
+    graph: GraphId,
+    group: Option<GroupId>,
+}
+
 /// What the details pane is describing.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Selection {
@@ -39,9 +49,16 @@ struct App {
 
     /// Graph currently being viewed. Changes when entering a subgraph.
     graph: GraphId,
+    /// Group tree for each graph, absent where names carry no structure.
+    hierarchies: HashMap<GraphId, Option<Hierarchy>>,
+    /// Whether to draw blocks rather than individual operators, where the
+    /// current graph's names support it.
+    grouped: bool,
+    /// The block currently open, within the current graph's hierarchy.
+    scope: GroupId,
     /// Layouts are computed on first view and kept, since they are expensive
-    /// relative to a frame and never change for a given graph.
-    layouts: HashMap<GraphId, Layout>,
+    /// relative to a frame and never change for a given view.
+    layouts: HashMap<ViewKey, Layout>,
     layout_options: LayoutOptions,
 
     canvas: Canvas,
@@ -58,6 +75,11 @@ impl App {
             model,
             file_name,
             graph,
+            hierarchies: HashMap::new(),
+            // Enabled by default wherever the model supports it; this is the
+            // more useful way to read a large model.
+            grouped: true,
+            scope: GroupId(0),
             layouts: HashMap::new(),
             layout_options: LayoutOptions::default(),
             canvas: Canvas::new(),
@@ -69,12 +91,69 @@ impl App {
         app
     }
 
-    fn ensure_layout(&mut self) {
-        if self.layouts.contains_key(&self.graph) {
+    /// Whether the current graph's node names form a usable hierarchy.
+    fn has_hierarchy(&self) -> bool {
+        self.hierarchies
+            .get(&self.graph)
+            .is_some_and(|hierarchy| hierarchy.is_some())
+    }
+
+    /// The hierarchy in use for the current graph, if grouping is on and the
+    /// graph supports it.
+    fn active_hierarchy(&self) -> Option<&Hierarchy> {
+        if !self.grouped {
+            return None;
+        }
+        self.hierarchies.get(&self.graph)?.as_ref()
+    }
+
+    fn view_key(&self) -> ViewKey {
+        ViewKey {
+            graph: self.graph,
+            group: self.active_hierarchy().map(|_| self.scope),
+        }
+    }
+
+    fn ensure_hierarchy(&mut self) {
+        if self.hierarchies.contains_key(&self.graph) {
             return;
         }
-        let layout = layout_graph(self.model.graph(self.graph), &self.layout_options);
-        self.layouts.insert(self.graph, layout);
+        let hierarchy = Hierarchy::build(self.model.graph(self.graph));
+        self.hierarchies.insert(self.graph, hierarchy);
+    }
+
+    fn ensure_layout(&mut self) {
+        let key = self.view_key();
+        if self.layouts.contains_key(&key) {
+            return;
+        }
+        // Disjoint field borrows: the hierarchy is read while the cache is
+        // written.
+        let hierarchy = if self.grouped {
+            self.hierarchies
+                .get(&self.graph)
+                .and_then(|hierarchy| hierarchy.as_ref())
+        } else {
+            None
+        };
+        let scope = hierarchy.map(|hierarchy| Scope {
+            hierarchy,
+            group: self.scope,
+        });
+        let layout = layout_graph(self.model.graph(self.graph), scope, &self.layout_options);
+        self.layouts.insert(key, layout);
+    }
+
+    /// Open a block, so its contents are drawn in place of its box.
+    fn enter_group(&mut self, group: GroupId) {
+        self.scope = group;
+        self.selection = None;
+        self.canvas.request_home();
+    }
+
+    /// Whether the view can move up to an enclosing block.
+    fn parent_group(&self) -> Option<GroupId> {
+        self.active_hierarchy()?.group(self.scope).parent
     }
 
     fn refresh_matches(&mut self) {
@@ -94,22 +173,38 @@ impl App {
 
     fn go_to_graph(&mut self, graph: GraphId) {
         self.graph = graph;
+        self.scope = GroupId(0);
         self.selection = None;
         self.canvas.request_home();
+        self.ensure_hierarchy();
         self.refresh_matches();
     }
 
     /// Select a node, optionally bringing it into view on the canvas.
+    ///
+    /// With grouping on, the node may sit inside a block that is not open, so
+    /// the view moves to the block that contains it first.
     fn select_node(&mut self, id: NodeId, reveal: bool) {
         self.selection = Some(Selection::Node(id));
         if !reveal {
             return;
         }
+
+        if let Some(group) = self.active_hierarchy().map(|h| h.group_of(id)) {
+            if group != self.scope {
+                self.scope = group;
+                self.canvas.request_home();
+            }
+        }
+
+        // The block may have just changed, so the drawing to focus within may
+        // not have been built yet.
+        self.ensure_layout();
+        let key = self.view_key();
         let rect = self
             .layouts
-            .get(&self.graph)
-            .and_then(|layout| layout.node_index(id))
-            .map(|index| self.layouts[&self.graph].nodes[index].rect);
+            .get(&key)
+            .and_then(|layout| layout.node_index(id).map(|index| layout.nodes[index].rect));
         if let Some(rect) = rect {
             self.canvas.focus_on(rect);
         }
@@ -118,6 +213,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ensure_hierarchy();
         self.ensure_layout();
 
         egui::Panel::left("nav")
@@ -218,27 +314,50 @@ impl App {
 
     /// Path from the root graph to the current one, as clickable links.
     fn breadcrumb(&mut self, ui: &mut Ui) {
-        let path = self.model.path_to(self.graph);
-        if path.len() < 2 {
+        // The trail runs through any enclosing subgraphs, then down through
+        // the blocks opened within the current graph.
+        let mut trail: Vec<(String, Step)> = self
+            .model
+            .path_to(self.graph)
+            .into_iter()
+            .map(|id| (self.model.graph(id).label.clone(), Step::Graph(id)))
+            .collect();
+
+        if let Some(hierarchy) = self.active_hierarchy() {
+            for group_id in hierarchy.path_to(self.scope) {
+                let group = hierarchy.group(group_id);
+                // The root group stands for the whole graph, which the graph
+                // trail already names.
+                if group.parent.is_some() {
+                    trail.push((group.name.clone(), Step::Group(group_id)));
+                }
+            }
+        }
+
+        if trail.len() < 2 {
             return;
         }
-        let mut target = None;
+
+        let mut clicked = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            for (i, graph_id) in path.iter().enumerate() {
-                if i > 0 {
+            let last = trail.len() - 1;
+            for (index, (label, step)) in trail.iter().enumerate() {
+                if index > 0 {
                     ui.label(RichText::new("›").weak());
                 }
-                let label = self.model.graph(*graph_id).label.clone();
-                if i + 1 == path.len() {
+                if index == last {
                     ui.label(RichText::new(label).strong());
                 } else if ui.link(label).clicked() {
-                    target = Some(*graph_id);
+                    clicked = Some(*step);
                 }
             }
         });
-        if let Some(graph_id) = target {
-            self.go_to_graph(graph_id);
+
+        match clicked {
+            Some(Step::Graph(id)) => self.go_to_graph(id),
+            Some(Step::Group(id)) => self.enter_group(id),
+            None => {}
         }
     }
 
@@ -273,6 +392,11 @@ impl App {
 impl App {
     fn graph_panel(&mut self, ui: &mut Ui) {
         let mut home = false;
+        let mut up = false;
+        let mut toggled = false;
+        let parent = self.parent_group();
+        let has_hierarchy = self.has_hierarchy();
+
         ui.horizontal(|ui| {
             ui.strong(&self.model.graph(self.graph).label);
             ui.separator();
@@ -280,6 +404,20 @@ impl App {
                 .button("Home")
                 .on_hover_text("Go to the first input, at a legible zoom")
                 .clicked();
+
+            if has_hierarchy {
+                toggled = ui
+                    .checkbox(&mut self.grouped, "Blocks")
+                    .on_hover_text("Group operators by the structure in their names")
+                    .changed();
+                if parent.is_some() {
+                    up = ui
+                        .button("Up")
+                        .on_hover_text("Leave this block")
+                        .clicked();
+                }
+            }
+
             ui.label(
                 RichText::new(format_zoom(self.canvas.zoom()))
                     .weak()
@@ -296,11 +434,39 @@ impl App {
         if home {
             self.canvas.request_home();
         }
+        if toggled {
+            // The drawing changes completely, so the previous view is no
+            // longer meaningful.
+            self.scope = GroupId(0);
+            self.selection = None;
+            self.canvas.request_home();
+        }
+        if up {
+            if let Some(parent) = parent {
+                let left = self.scope;
+                self.enter_group(parent);
+                // Come back out looking at the block just left, rather than at
+                // the top of an unfamiliar drawing.
+                self.ensure_layout();
+                let key = self.view_key();
+                let rect = self.layouts.get(&key).and_then(|layout| {
+                    layout
+                        .group_index(left)
+                        .map(|index| layout.nodes[index].rect)
+                });
+                if let Some(rect) = rect {
+                    self.canvas.focus_on(rect);
+                }
+            }
+        }
+        // Toggling or moving up may have selected a view with no layout yet.
+        self.ensure_layout();
         ui.separator();
 
         // Disjoint field borrows: the canvas is mutated while the layout it
         // draws is borrowed from the cache.
-        let layout = &self.layouts[&self.graph];
+        let key = self.view_key();
+        let layout = &self.layouts[&key];
         let selected_index = match self.selection {
             Some(Selection::Node(id)) => layout.node_index(id),
             Some(Selection::Value(id)) => layout
@@ -312,26 +478,116 @@ impl App {
         let event = self.canvas.show(ui, layout, selected_index);
 
         match event {
-            CanvasEvent::Selected(index) => {
-                let selection = match self.layouts[&self.graph].nodes[index].kind {
-                    ItemKind::Op(id) => Selection::Node(id),
-                    ItemKind::Input(id) | ItemKind::Output(id) => Selection::Value(id),
-                };
-                self.selection = Some(selection);
-            }
+            CanvasEvent::Selected(index) => match self.layouts[&key].nodes[index].kind {
+                // Clicking a block opens it, which is the point of grouping.
+                ItemKind::Group(group) => self.enter_group(group),
+                ItemKind::Op(id) => self.selection = Some(Selection::Node(id)),
+                ItemKind::Input(id) | ItemKind::Output(id) => {
+                    self.selection = Some(Selection::Value(id))
+                }
+            },
             CanvasEvent::Cleared => self.selection = None,
             CanvasEvent::None => {}
         }
     }
 }
 
+/// One step in the breadcrumb trail.
+#[derive(Copy, Clone)]
+enum Step {
+    Graph(GraphId),
+    Group(GroupId),
+}
+
 // Details panel.
 impl App {
     fn details_panel(&mut self, ui: &mut Ui) {
+        let inside_block = self
+            .active_hierarchy()
+            .is_some_and(|hierarchy| self.scope != hierarchy.root());
+
         match self.selection {
             Some(Selection::Node(id)) => self.node_details(ui, id),
             Some(Selection::Value(id)) => self.value_details(ui, id),
+            None if inside_block => self.block_overview(ui),
             None => self.graph_overview(ui),
+        }
+    }
+
+    /// Summarise the block currently open, when nothing else is selected.
+    fn block_overview(&mut self, ui: &mut Ui) {
+        let Some(hierarchy) = self.active_hierarchy() else {
+            return;
+        };
+        let group = hierarchy.group(self.scope);
+        let name = group.name.clone();
+        let path = group.path.clone();
+        let total = group.total_nodes;
+        let direct = group.nodes.len();
+        let children: Vec<(GroupId, String, usize)> = group
+            .children
+            .iter()
+            .map(|id| {
+                let child = hierarchy.group(*id);
+                (*id, child.name.clone(), child.total_nodes)
+            })
+            .collect();
+        let counts = block_op_counts(self.model.graph(self.graph), hierarchy, self.scope);
+
+        ui.heading(&name);
+        ui.label(RichText::new(&path).weak());
+        ui.separator();
+
+        let mut enter = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("block_info")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Operators");
+                        ui.label(format_count(total as u64));
+                        ui.end_row();
+                        if direct > 0 {
+                            ui.label("Drawn here");
+                            ui.label(format_count(direct as u64));
+                            ui.end_row();
+                        }
+                        if !children.is_empty() {
+                            ui.label("Blocks");
+                            ui.label(children.len().to_string());
+                            ui.end_row();
+                        }
+                    });
+
+                if !children.is_empty() {
+                    ui.add_space(8.0);
+                    ui.strong("Blocks");
+                    for (id, name, count) in &children {
+                        if ui.link(format!("{name} ({count} operators)")).clicked() {
+                            enter = Some(*id);
+                        }
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.strong("Operators");
+                egui::Grid::new("block_op_counts")
+                    .num_columns(2)
+                    .spacing([16.0, 2.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (op_type, count) in &counts {
+                            ui.label(op_type);
+                            ui.label(count.to_string());
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if let Some(id) = enter {
+            self.enter_group(id);
         }
     }
 
@@ -612,6 +868,26 @@ impl App {
             self.select_node(target, true);
         }
     }
+}
+
+/// Count operator types within a block, including everything nested inside it.
+fn block_op_counts(graph: &Graph, hierarchy: &Hierarchy, group: GroupId) -> Vec<(String, usize)> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut pending = vec![group];
+    while let Some(id) = pending.pop() {
+        let group = hierarchy.group(id);
+        for node_id in &group.nodes {
+            *counts.entry(graph.node(*node_id).op_type.as_str()).or_default() += 1;
+        }
+        pending.extend(group.children.iter().copied());
+    }
+
+    let mut counts: Vec<(String, usize)> = counts
+        .into_iter()
+        .map(|(op_type, count)| (op_type.to_string(), count))
+        .collect();
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts
 }
 
 /// Colour for tensor types and shapes in the details pane.
