@@ -34,12 +34,6 @@ cargo install --path .
 onnx-explorer model.onnx
 ```
 
-Print a summary to the terminal instead of opening a window:
-
-```sh
-onnx-explorer --summary model.onnx
-```
-
 ## AI development disclaimer
 
 This project was vibe-coded with Claude Code. The author has not read most of
