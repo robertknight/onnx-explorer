@@ -63,6 +63,14 @@ struct App {
     canvas: Canvas,
     selection: Option<Selection>,
     query: String,
+    /// Whether the filter's matches are listed in place of the details.
+    ///
+    /// This cannot simply follow the filter box's focus. egui resolves clicks
+    /// and focus at the start of a frame using the previous frame's layout, so
+    /// by the time the box is drawn on the frame a match is clicked, focus has
+    /// already been surrendered. Following focus would hide the list on that
+    /// very frame and the click would never reach it.
+    filtering: bool,
     /// Nodes of the current graph matching `query`, in graph order.
     matches: Vec<NodeId>,
 }
@@ -83,6 +91,7 @@ impl App {
             canvas: Canvas::new(),
             selection: None,
             query: String::new(),
+            filtering: false,
             matches: Vec::new(),
         };
         app.refresh_matches();
@@ -214,25 +223,19 @@ impl eframe::App for App {
         self.ensure_hierarchy();
         self.ensure_layout();
 
-        egui::Panel::left("nav")
+        egui::Panel::right("side")
             .resizable(true)
-            .default_size(320.0)
-            .size_range(220.0..=520.0)
-            .show(ui, |ui| self.nav_panel(ui));
-
-        egui::Panel::right("details")
-            .resizable(true)
-            .default_size(360.0)
-            .size_range(260.0..=640.0)
-            .show(ui, |ui| self.details_panel(ui));
+            .default_size(380.0)
+            .size_range(280.0..=680.0)
+            .show(ui, |ui| self.side_panel(ui));
 
         egui::CentralPanel::default().show(ui, |ui| self.graph_panel(ui));
     }
 }
 
-// Navigation panel.
+// Side panel.
 impl App {
-    fn nav_panel(&mut self, ui: &mut Ui) {
+    fn side_panel(&mut self, ui: &mut Ui) {
         ui.add_space(4.0);
         ui.collapsing("Model", |ui| self.model_info(ui));
 
@@ -240,6 +243,26 @@ impl App {
         self.breadcrumb(ui);
 
         ui.add_space(4.0);
+        let filtering = self.filter_box(ui);
+
+        ui.separator();
+
+        // The match list stands in for the details while the filter is in
+        // use, so neither the graph nor the details give up room to it.
+        // Choosing a match moves focus off the box, which brings the details
+        // for the chosen node straight back.
+        if filtering {
+            self.node_list(ui);
+        } else {
+            self.details_panel(ui);
+        }
+    }
+
+    /// Draw the node filter, returning whether its matches should be listed.
+    ///
+    /// Taking focus opens the list; it stays open until a match is chosen, the
+    /// graph is clicked, or Escape dismisses it.
+    fn filter_box(&mut self, ui: &mut Ui) -> bool {
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.query)
                 .hint_text("Filter by name or op type  (/)")
@@ -247,6 +270,9 @@ impl App {
         );
         if response.changed() {
             self.refresh_matches();
+        }
+        if response.gained_focus() {
+            self.filtering = true;
         }
 
         // "/" jumps to the filter, as in a pager. The key is consumed so it is
@@ -259,11 +285,16 @@ impl App {
             });
             if pressed {
                 response.request_focus();
+                self.filtering = true;
             }
         }
 
-        ui.separator();
-        self.node_list(ui);
+        if self.filtering && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.filtering = false;
+            response.surrender_focus();
+        }
+
+        self.filtering
     }
 
     fn model_info(&mut self, ui: &mut Ui) {
@@ -380,6 +411,8 @@ impl App {
 
         if let Some(node_id) = clicked {
             self.select_node(node_id, true);
+            // The chosen node's details replace the list.
+            self.filtering = false;
         }
     }
 }
@@ -485,6 +518,9 @@ impl App {
             CanvasEvent::Cleared => self.selection = None,
             CanvasEvent::None => {}
         }
+        if !matches!(event, CanvasEvent::None) {
+            self.filtering = false;
+        }
     }
 }
 
@@ -519,7 +555,6 @@ impl App {
         let name = group.name.clone();
         let path = group.path.clone();
         let total = group.total_nodes;
-        let direct = group.nodes.len();
         let children: Vec<(GroupId, String, usize)> = group
             .children
             .iter()
@@ -545,11 +580,6 @@ impl App {
                         ui.label("Operators");
                         ui.label(format_count(total as u64));
                         ui.end_row();
-                        if direct > 0 {
-                            ui.label("Drawn here");
-                            ui.label(format_count(direct as u64));
-                            ui.end_row();
-                        }
                         if !children.is_empty() {
                             ui.label("Blocks");
                             ui.label(children.len().to_string());
