@@ -355,9 +355,8 @@ impl Canvas {
             }
 
             if self.zoom >= ZOOM_SHOW_EDGE_LABELS && !edge.label.is_empty() {
-                let middle = points[points.len() / 2];
                 painter.text(
-                    middle + vec2(4.0, 0.0),
+                    polyline_middle(&points) + vec2(4.0, 0.0),
                     Align2::LEFT_CENTER,
                     elide(&edge.label, 28),
                     FontId::proportional(9.0 * self.zoom),
@@ -486,6 +485,23 @@ impl Canvas {
                 );
                 painter.rect_filled(cell, 0, palette.density.gamma_multiply(weight));
             }
+        }
+    }
+}
+
+/// The middle of a polyline: its central point where there is an odd number
+/// of them, or the midpoint of the two central points where there is not.
+///
+/// Indexing the halfway element instead lands on an endpoint for a two point
+/// line, which put edge labels on top of the node the edge arrives at.
+fn polyline_middle(points: &[Pos2]) -> Pos2 {
+    match points.len() {
+        0 => Pos2::ZERO,
+        1 => points[0],
+        len if len % 2 == 1 => points[len / 2],
+        len => {
+            let (before, after) = (points[len / 2 - 1], points[len / 2]);
+            before + (after - before) * 0.5
         }
     }
 }
@@ -622,9 +638,9 @@ fn clamp_axis(pan: f32, min: f32, max: f32, size: f32, keep: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use egui::{Pos2, Rect, Vec2, vec2};
+    use egui::{Pos2, Rect, Vec2, pos2, vec2};
 
-    use super::{HOME_ZOOM, KEEP_VISIBLE, clamp_axis, min_zoom};
+    use super::{HOME_ZOOM, KEEP_VISIBLE, clamp_axis, min_zoom, polyline_middle};
 
     fn viewport() -> Rect {
         Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))
@@ -632,6 +648,36 @@ mod tests {
 
     fn drawing(width: f32, height: f32) -> Rect {
         Rect::from_min_size(Pos2::ZERO, vec2(width, height))
+    }
+
+    #[test]
+    fn test_polyline_middle_of_a_straight_edge() {
+        // Most edges are two points. Indexing the halfway element gives the
+        // arrow tip, which put the label on top of the target node.
+        let middle = polyline_middle(&[pos2(0.0, 0.0), pos2(10.0, 100.0)]);
+        assert_eq!(middle, pos2(5.0, 50.0));
+    }
+
+    #[test]
+    fn test_polyline_middle_of_a_routed_edge() {
+        // An odd number of points has a central one.
+        let points = [pos2(0.0, 0.0), pos2(20.0, 50.0), pos2(0.0, 100.0)];
+        assert_eq!(polyline_middle(&points), pos2(20.0, 50.0));
+
+        // An even number falls between the two central points.
+        let points = [
+            pos2(0.0, 0.0),
+            pos2(20.0, 40.0),
+            pos2(20.0, 80.0),
+            pos2(0.0, 120.0),
+        ];
+        assert_eq!(polyline_middle(&points), pos2(20.0, 60.0));
+    }
+
+    #[test]
+    fn test_polyline_middle_of_a_degenerate_line() {
+        assert_eq!(polyline_middle(&[]), Pos2::ZERO);
+        assert_eq!(polyline_middle(&[pos2(3.0, 4.0)]), pos2(3.0, 4.0));
     }
 
     #[test]

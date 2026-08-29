@@ -21,9 +21,12 @@ pub struct LayoutOptions {
     pub node_height: f32,
     pub min_node_width: f32,
     pub max_node_width: f32,
-    /// Estimated width of one character, used to size a node from its label.
-    /// Labels are elided to fit when drawn, so this only needs to be close.
+    /// Estimated width of one character of a box's title, used to size the
+    /// box. Labels are elided to fit when drawn, so this only needs to be
+    /// close.
     pub char_width: f32,
+    /// The same for the smaller text of a box's subtitle.
+    pub subtitle_char_width: f32,
     /// Vertical gap between ranks.
     pub layer_gap: f32,
     /// Minimum horizontal gap between nodes in the same rank.
@@ -47,6 +50,7 @@ impl Default for LayoutOptions {
             min_node_width: 96.0,
             max_node_width: 280.0,
             char_width: 7.6,
+            subtitle_char_width: 5.9,
             layer_gap: 46.0,
             node_gap: 18.0,
             ordering_iterations: 8,
@@ -302,7 +306,12 @@ impl<'a> Collector<'a> {
     }
 
     fn push(&mut self, kind: ItemKind, title: String, subtitle: String) -> usize {
-        let width = (title.chars().count() as f32 * self.opts.char_width + 28.0)
+        // Both lines are drawn inside the box, so the wider of the two decides
+        // its width. Sizing from the title alone leaves a long subtitle, such
+        // as the type of a graph input, elided in a box with room to spare.
+        let title_width = title.chars().count() as f32 * self.opts.char_width;
+        let subtitle_width = subtitle.chars().count() as f32 * self.opts.subtitle_char_width;
+        let width = (title_width.max(subtitle_width) + 28.0)
             .clamp(self.opts.min_node_width, self.opts.max_node_width);
         let index = self.nodes.len();
         self.nodes.push(LayoutNode {
@@ -1291,6 +1300,33 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|n| matches!(n.kind, ItemKind::Group(_)))
+        );
+    }
+
+    #[test]
+    fn test_box_is_wide_enough_for_its_subtitle() {
+        // A short op type with a long node name beneath it. Sizing from the
+        // title alone would leave the name elided in a box at minimum width.
+        let name = "block.0.attention.matmul";
+        let model = model(GraphProto {
+            node: vec![node("Mul", name, &["x"], &["y"])],
+            input: vec![value_info("x")],
+            ..Default::default()
+        });
+
+        let opts = LayoutOptions::default();
+        let layout = layout_graph(model.root(), None, &opts);
+        let mul = layout.nodes.iter().find(|n| n.title == "Mul").unwrap();
+
+        assert!(
+            mul.rect.width() > opts.min_node_width,
+            "box should grow past its minimum, was {}",
+            mul.rect.width()
+        );
+        assert!(
+            mul.rect.width() >= name.chars().count() as f32 * opts.subtitle_char_width,
+            "box should fit the subtitle, was {}",
+            mul.rect.width()
         );
     }
 
