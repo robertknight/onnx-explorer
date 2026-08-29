@@ -20,9 +20,6 @@ use egui::{
 use crate::layout::{ItemKind, Layout};
 use crate::text::elide;
 
-// Deep models produce very tall drawings: a 39,000 node graph lays out nearly
-// two million points tall, needing a zoom around 0.0005 to fit on screen.
-const MIN_ZOOM: f32 = 0.0001;
 const MAX_ZOOM: f32 = 4.0;
 
 /// Zoom at which node titles become legible enough to draw.
@@ -123,7 +120,10 @@ impl Canvas {
             PendingView::Focus(target) => self.focus(viewport, target),
         }
 
-        self.handle_input(ui, viewport, &response);
+        self.handle_input(ui, viewport, &response, layout.bounds);
+        // Also applied outside `zoom_at`, since resizing the window changes
+        // the zoom at which the drawing fits.
+        self.zoom = self.zoom.clamp(min_zoom(viewport, layout.bounds), MAX_ZOOM);
         self.clamp_pan(viewport, layout.bounds);
         self.draw(ui, viewport, layout, selected);
 
@@ -223,15 +223,15 @@ impl Canvas {
     }
 
     /// Zoom by `factor`, keeping the scene point under the pointer fixed.
-    fn zoom_at(&mut self, viewport: Rect, pointer: Pos2, factor: f32) {
+    fn zoom_at(&mut self, viewport: Rect, pointer: Pos2, factor: f32, lowest: f32) {
         let previous = self.zoom;
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom = (self.zoom * factor).clamp(lowest, MAX_ZOOM);
         let ratio = self.zoom / previous;
         let local = pointer - viewport.min;
         self.pan = local - (local - self.pan) * ratio;
     }
 
-    fn handle_input(&mut self, ui: &Ui, viewport: Rect, response: &egui::Response) {
+    fn handle_input(&mut self, ui: &Ui, viewport: Rect, response: &egui::Response, bounds: Rect) {
         if response.dragged() {
             self.pan += response.drag_delta();
         }
@@ -246,7 +246,7 @@ impl Canvas {
         // plain scrolling to pan.
         if zoom_delta != 1.0 {
             if let Some(pointer) = response.hover_pos() {
-                self.zoom_at(viewport, pointer, zoom_delta);
+                self.zoom_at(viewport, pointer, zoom_delta, min_zoom(viewport, bounds));
             }
         } else if scroll != Vec2::ZERO {
             self.pan += scroll;
@@ -584,6 +584,22 @@ impl Palette {
     }
 }
 
+/// The furthest the view may zoom out: the point at which the whole drawing
+/// fits in the viewport.
+///
+/// Zooming out beyond this only shrinks a drawing that is already wholly
+/// visible. The result is capped at the zoom a graph opens at, so a drawing
+/// smaller than the window can still be viewed at its natural size rather
+/// than being forced to fill it.
+fn min_zoom(viewport: Rect, bounds: Rect) -> f32 {
+    if !bounds.is_finite() || bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+        return HOME_ZOOM;
+    }
+    let scale_x = viewport.width() / bounds.width();
+    let scale_y = viewport.height() / bounds.height();
+    scale_x.min(scale_y).min(HOME_ZOOM)
+}
+
 /// Clamp a pan offset along one axis so that at least `keep` points of the
 /// content stay inside a viewport of length `size`.
 ///
@@ -606,7 +622,46 @@ fn clamp_axis(pan: f32, min: f32, max: f32, size: f32, keep: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{KEEP_VISIBLE, clamp_axis};
+    use egui::{Pos2, Rect, Vec2, vec2};
+
+    use super::{HOME_ZOOM, KEEP_VISIBLE, clamp_axis, min_zoom};
+
+    fn viewport() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))
+    }
+
+    fn drawing(width: f32, height: f32) -> Rect {
+        Rect::from_min_size(Pos2::ZERO, vec2(width, height))
+    }
+
+    #[test]
+    fn test_min_zoom_stops_where_the_drawing_fits() {
+        // Twice the viewport in both directions, so it fits at half scale.
+        assert_eq!(min_zoom(viewport(), drawing(2000.0, 1600.0)), 0.5);
+    }
+
+    #[test]
+    fn test_min_zoom_follows_the_tighter_axis() {
+        // The very tall drawings deep models produce are limited by height.
+        assert_eq!(min_zoom(viewport(), drawing(1000.0, 80_000.0)), 0.01);
+    }
+
+    #[test]
+    fn test_min_zoom_leaves_a_small_drawing_at_its_natural_size() {
+        // Fitting this would mean magnifying it ten times, which is not what
+        // a limit on zooming out should do.
+        assert_eq!(min_zoom(viewport(), drawing(100.0, 80.0)), HOME_ZOOM);
+    }
+
+    #[test]
+    fn test_min_zoom_handles_an_empty_drawing() {
+        let zoom = min_zoom(viewport(), Rect::from_min_size(Pos2::ZERO, Vec2::ZERO));
+        assert!(
+            zoom.is_finite(),
+            "a zero-sized drawing must not divide by zero"
+        );
+        assert_eq!(zoom, HOME_ZOOM);
+    }
 
     #[test]
     fn test_clamp_axis_allows_free_movement_in_range() {
