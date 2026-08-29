@@ -1,0 +1,45 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches:
+    - 'main'
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Install system dependencies
+      # Linux dependencies of eframe. Needed to link the test binary, even
+      # though the tests themselves do not open a window.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libxcb-render0-dev \
+          libxcb-shape0-dev \
+          libxcb-xfixes0-dev \
+          libxkbcommon-dev \
+          libssl-dev
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install stable --component clippy,rustfmt
+        rustup default stable
+    - name: Verify Rust version
+      run: |
+        rustc --version
+        cargo --version
+    - name: Install just
+      run: |
+        mkdir -p ~/.just
+        curl -L https://github.com/casey/just/releases/download/1.50.0/just-1.50.0-x86_64-unknown-linux-musl.tar.gz | tar xzf - -C ~/.just
+        echo "$HOME/.just" >> "$GITHUB_PATH"
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Check
+      run: just check
