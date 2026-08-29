@@ -471,6 +471,8 @@ pub enum AttrValue {
     Strings(Vec<String>),
     Tensor(Tensor),
     Graph(GraphId),
+    /// An integer naming an element type, such as `Cast`'s `to`.
+    DataType(DataType),
     /// An attribute whose type `rten_onnx` does not decode.
     Unsupported(i32),
 }
@@ -487,6 +489,7 @@ impl AttrValue {
             AttrValue::Strings(_) => "string[]",
             AttrValue::Tensor(_) => "tensor",
             AttrValue::Graph(_) => "graph",
+            AttrValue::DataType(_) => "data type",
             AttrValue::Unsupported(_) => "unsupported",
         }
     }
@@ -521,6 +524,9 @@ impl fmt::Display for AttrValue {
             AttrValue::Strings(v) => write_list(f, v),
             AttrValue::Tensor(t) => write!(f, "{}{}", t.dtype, t.shape()),
             AttrValue::Graph(_) => write!(f, "<subgraph>"),
+            // `DataType` names the type where it recognises the value, and
+            // falls back to the number where it does not.
+            AttrValue::DataType(dtype) => write!(f, "{dtype}"),
             AttrValue::Unsupported(ty) => write!(f, "<unsupported attribute type {ty}>"),
         }
     }
@@ -709,6 +715,14 @@ impl Builder {
             }
         };
 
+        // Some integer attributes are element types rather than plain numbers.
+        let value = match value {
+            AttrValue::Int(int) if names_a_data_type(op_type, &name) => {
+                AttrValue::DataType(DataType(int as i32))
+            }
+            other => other,
+        };
+
         Attribute { name, value }
     }
 
@@ -723,6 +737,28 @@ impl Builder {
         self.build_graph(proto, id, Some(parent), format!("{op_type}.{attr_name}"));
         id
     }
+}
+
+/// Whether an integer attribute holds an element type rather than a number.
+///
+/// ONNX stores these as values of the `TensorProto.DataType` enum, so on the
+/// wire they are indistinguishable from any other integer. `Cast`'s `to` is
+/// the one most often read; the rest describe the type a generator produces.
+fn names_a_data_type(op_type: &str, attr_name: &str) -> bool {
+    matches!(
+        (op_type, attr_name),
+        ("Cast", "to")
+            | (
+                "EyeLike"
+                    | "Multinomial"
+                    | "RandomNormal"
+                    | "RandomNormalLike"
+                    | "RandomUniform"
+                    | "RandomUniformLike"
+                    | "SequenceEmpty",
+                "dtype",
+            )
+    )
 }
 
 /// Get or create the value with `name`, returning `None` for the empty name
@@ -1224,6 +1260,60 @@ mod tests {
         assert_eq!(graph.constant_tensor(w).unwrap().elem_count(), 32);
         assert!(graph.nodes()[0].is_constant());
         assert!(!graph.nodes()[1].is_constant());
+    }
+
+    #[test]
+    fn test_data_type_attributes_are_shown_by_name() {
+        fn attr(op_type: &str, attr_name: &str, value: i64) -> NodeProto {
+            NodeProto {
+                op_type: Some(op_type.to_string()),
+                name: Some("n".to_string()),
+                attribute: vec![AttributeProto {
+                    name: Some(attr_name.to_string()),
+                    i: Some(value),
+                    r#type: Some(AttributeType::INT),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        fn rendered(node: NodeProto) -> (String, String) {
+            let model = model(GraphProto {
+                node: vec![node],
+                ..Default::default()
+            });
+            let attr = &model.root().nodes()[0].attrs[0];
+            (attr.value.type_name().to_string(), attr.value.to_string())
+        }
+
+        // `Cast` stores its target type as the integer value of the ONNX
+        // element type enum, which says nothing on its own.
+        assert_eq!(
+            rendered(attr("Cast", "to", 1)),
+            ("data type".to_string(), "FLOAT".to_string())
+        );
+        assert_eq!(
+            rendered(attr("RandomNormal", "dtype", 11)),
+            ("data type".to_string(), "DOUBLE".to_string())
+        );
+
+        // An element type the parser does not know still shows its number
+        // rather than nothing.
+        assert_eq!(
+            rendered(attr("Cast", "to", 999)),
+            ("data type".to_string(), "999".to_string())
+        );
+
+        // An integer attribute that is not a type is left alone.
+        assert_eq!(
+            rendered(attr("Concat", "axis", 1)),
+            ("int".to_string(), "1".to_string())
+        );
+        assert_eq!(
+            rendered(attr("Gather", "to", 1)),
+            ("int".to_string(), "1".to_string())
+        );
     }
 
     #[test]
