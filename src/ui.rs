@@ -9,7 +9,7 @@ use crate::canvas::{Canvas, CanvasEvent};
 use crate::hierarchy::{GroupId, Hierarchy};
 use crate::layout::{ItemKind, Layout, LayoutOptions, Scope, layout_graph};
 use crate::model::{
-    AttrValue, Graph, GraphId, Model, NodeId, Tensor, TensorData, Value, ValueId, ValueKind,
+    AttrValue, GraphId, Model, NodeId, Tensor, TensorData, Value, ValueId, ValueKind,
 };
 use crate::text::{elide, format_count};
 
@@ -237,7 +237,7 @@ impl eframe::App for App {
 impl App {
     fn side_panel(&mut self, ui: &mut Ui) {
         ui.add_space(4.0);
-        ui.collapsing("Model", |ui| self.model_info(ui));
+        ui.collapsing("Model info", |ui| self.model_info(ui));
 
         ui.add_space(4.0);
         self.breadcrumb(ui);
@@ -265,7 +265,7 @@ impl App {
     fn filter_box(&mut self, ui: &mut Ui) -> bool {
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.query)
-                .hint_text("Filter by name or op type  (/)")
+                .hint_text("Find node by name or type  (/)")
                 .desired_width(f32::INFINITY),
         );
         if response.changed() {
@@ -563,7 +563,6 @@ impl App {
                 (*id, child.name.clone(), child.total_nodes)
             })
             .collect();
-        let counts = block_op_counts(self.model.graph(self.graph), hierarchy, self.scope);
 
         ui.heading(&name);
         ui.label(RichText::new(&path).weak());
@@ -597,19 +596,6 @@ impl App {
                     }
                 }
 
-                ui.add_space(8.0);
-                ui.strong("Operators");
-                egui::Grid::new("block_op_counts")
-                    .num_columns(2)
-                    .spacing([16.0, 2.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for (op_type, count) in &counts {
-                            ui.label(op_type);
-                            ui.label(count.to_string());
-                            ui.end_row();
-                        }
-                    });
             });
 
         if let Some(id) = enter {
@@ -618,11 +604,6 @@ impl App {
     }
 
     fn graph_overview(&mut self, ui: &mut Ui) {
-        let graph = self.model.graph(self.graph);
-        ui.heading(&graph.label);
-        ui.label(RichText::new("Select a node to see its details.").weak());
-        ui.separator();
-
         let mut goto = None;
         let mut select = None;
         egui::ScrollArea::vertical()
@@ -671,19 +652,6 @@ impl App {
                     }
                 }
 
-                ui.add_space(8.0);
-                ui.strong("Operators");
-                egui::Grid::new("op_counts")
-                    .num_columns(2)
-                    .spacing([16.0, 2.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for (op_type, count) in graph.op_type_counts() {
-                            ui.label(op_type);
-                            ui.label(count.to_string());
-                            ui.end_row();
-                        }
-                    });
             });
 
         if let Some(subgraph_id) = goto {
@@ -894,26 +862,6 @@ impl App {
             self.select_node(target, true);
         }
     }
-}
-
-/// Count operator types within a block, including everything nested inside it.
-fn block_op_counts(graph: &Graph, hierarchy: &Hierarchy, group: GroupId) -> Vec<(String, usize)> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    let mut pending = vec![group];
-    while let Some(id) = pending.pop() {
-        let group = hierarchy.group(id);
-        for node_id in &group.nodes {
-            *counts.entry(graph.node(*node_id).op_type.as_str()).or_default() += 1;
-        }
-        pending.extend(group.children.iter().copied());
-    }
-
-    let mut counts: Vec<(String, usize)> = counts
-        .into_iter()
-        .map(|(op_type, count)| (op_type.to_string(), count))
-        .collect();
-    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    counts
 }
 
 /// Colour for tensor types and shapes in the details pane.
