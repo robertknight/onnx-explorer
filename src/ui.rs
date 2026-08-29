@@ -277,13 +277,18 @@ impl App {
             self.filtering = true;
         }
 
-        // "/" jumps to the filter, as in a pager. The key is consumed so it is
-        // not typed into the box, and ignored while the box already has focus
-        // so that a slash can still be searched for.
+        // "/" jumps to the filter, as in a pager, and Cmd+F or Ctrl+F does the
+        // same for anyone who reaches for the usual find shortcut. The keys are
+        // consumed so they are not typed into the box, and ignored while the
+        // box already has focus so that a slash can still be searched for.
+        //
+        // `COMMAND` is Cmd on macOS and Ctrl elsewhere, so one binding covers
+        // both.
         if !response.has_focus() {
             let pressed = ui.input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Slash)
                     || input.consume_key(egui::Modifiers::SHIFT, egui::Key::Slash)
+                    || input.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
             });
             if pressed {
                 response.request_focus();
