@@ -339,7 +339,7 @@ impl<'a> Collector<'a> {
                     let index = self.push(
                         ItemKind::Group(*child),
                         child_group.name.clone(),
-                        format!("{count} nodes"),
+                        format!("{count} operators"),
                     );
                     self.group_by_id.insert(*child, index);
                 }
@@ -1171,7 +1171,7 @@ mod tests {
 
         // A block's box reports everything nested inside it.
         let layer0 = layout.nodes.iter().find(|n| n.title == "layers.0").unwrap();
-        assert_eq!(layer0.subtitle, "4 nodes");
+        assert_eq!(layer0.subtitle, "4 operators");
 
         // x -> embed -> layers.0 -> layers.1 -> y. The two edges inside
         // layers.0 are not visible at this level.

@@ -25,12 +25,12 @@ pub struct GroupId(pub u32);
 /// hierarchy is considered real rather than incidental.
 const MIN_NAMED_FRACTION: f64 = 0.3;
 
-/// Fewest nodes a block may hold.
+/// Fewest operators a block may hold.
 ///
-/// A block standing for a single node hides nothing and costs a level of
+/// A block standing for a single operator hides nothing and costs a level of
 /// navigation to see through, so such a node is left in the enclosing block
-/// instead. This cascades: a block holding nothing but a one-node block is
-/// itself down to one node, and is dropped in turn.
+/// instead. This cascades: a block holding nothing but a one-operator block is
+/// itself down to one operator, and is dropped in turn.
 const MIN_GROUP_NODES: usize = 2;
 
 pub struct Group {
@@ -40,9 +40,13 @@ pub struct Group {
     /// Full path, eg. `/layers.1/attn`. Empty for the root.
     pub path: String,
     pub children: Vec<GroupId>,
-    /// Nodes belonging to this group but not to any of its children.
+    /// Operators belonging to this group but not to any of its children.
+    ///
+    /// Constants are excluded. They are folded into the nodes that read them
+    /// rather than drawn, so counting them would describe blocks by work that
+    /// is never shown.
     pub nodes: Vec<NodeId>,
-    /// Nodes in this group and all of its descendants.
+    /// Operators in this group and all of its descendants.
     pub total_nodes: usize,
     pub depth: usize,
 }
@@ -101,6 +105,12 @@ impl Hierarchy {
                 }
             }
 
+            // Constants are folded into their consumers rather than drawn,
+            // so they do not count towards a block being worth having.
+            if node.is_constant() {
+                continue;
+            }
+
             path.clear();
             for segment in segments {
                 path.push('/');
@@ -121,15 +131,21 @@ impl Hierarchy {
             for segment in module_path(&node.name) {
                 path.push('/');
                 path.push_str(segment);
-                // A path can only lose nodes as it lengthens, so once one is
-                // too sparse to be worth a block, everything below it is too.
-                if population[&path] < MIN_GROUP_NODES {
+                // A path can only lose operators as it lengthens, so once one
+                // is too sparse to be worth a block, everything below it is
+                // too. A path with no operators at all is absent entirely,
+                // which a constant's own path may well be.
+                if population.get(&path).copied().unwrap_or(0) < MIN_GROUP_NODES {
                     break;
                 }
                 current = child_group(&mut groups, &mut by_path, current, segment);
             }
 
-            groups[current.0 as usize].nodes.push(node.id);
+            if !node.is_constant() {
+                groups[current.0 as usize].nodes.push(node.id);
+            }
+            // Recorded for every node, so that the group of any node can be
+            // asked for even when it is not one that gets drawn.
             node_group[node.id.0 as usize] = current;
         }
 
@@ -249,7 +265,9 @@ fn child_group(
 mod tests {
     use super::{Hierarchy, Placement, module_path};
     use crate::model::Model;
-    use rten_onnx::onnx::{GraphProto, ModelProto, NodeProto};
+    use rten_onnx::onnx::{
+        AttributeProto, DataType, GraphProto, ModelProto, NodeProto, TensorProto,
+    };
 
     fn node(op_type: &str, name: &str) -> NodeProto {
         NodeProto {
@@ -259,6 +277,27 @@ mod tests {
             } else {
                 Some(name.to_string())
             },
+            ..Default::default()
+        }
+    }
+
+    /// A `Constant` node, which is folded into its consumers rather than
+    /// drawn.
+    fn constant(name: &str) -> NodeProto {
+        NodeProto {
+            op_type: Some("Constant".to_string()),
+            name: Some(name.to_string()),
+            output: vec![name.to_string()],
+            attribute: vec![AttributeProto {
+                name: Some("value".to_string()),
+                t: Some(TensorProto {
+                    name: Some(name.to_string()),
+                    dims: vec![1],
+                    data_type: Some(DataType::FLOAT),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
@@ -401,6 +440,33 @@ mod tests {
         // That node is drawn in the enclosing block instead.
         assert_eq!(hierarchy.group(layers0).nodes.len(), 1);
         assert_eq!(hierarchy.group_of(model.root().nodes()[2].id), layers0);
+    }
+
+    #[test]
+    fn test_constants_do_not_count_towards_a_block() {
+        let model = model(vec![
+            node("MatMul", "/layers.0/attn/MatMul"),
+            node("Add", "/layers.0/attn/Add"),
+            // One operator and two constants. The constants are folded into
+            // whatever reads them, so `mlp` is still a one-operator block.
+            node("Mul", "/layers.0/mlp/Mul"),
+            constant("/layers.0/mlp/Constant"),
+            constant("/layers.0/mlp/Constant_1"),
+        ]);
+        let hierarchy = Hierarchy::build(model.root()).unwrap();
+
+        let layers0 = hierarchy.group(hierarchy.root()).children[0];
+        let children: Vec<&str> = hierarchy
+            .group(layers0)
+            .children
+            .iter()
+            .map(|id| hierarchy.group(*id).name.as_str())
+            .collect();
+        assert_eq!(children, ["attn"]);
+
+        // Three operators, not five nodes.
+        assert_eq!(hierarchy.group(layers0).total_nodes, 3);
+        assert_eq!(hierarchy.group(layers0).nodes.len(), 1);
     }
 
     #[test]
