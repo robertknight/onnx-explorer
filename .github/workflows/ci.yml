@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
     - name: Install system dependencies
       # Linux dependencies of eframe. Needed to link the test binary, even
       # though the tests themselves do not open a window.
@@ -22,9 +22,12 @@ jobs:
           libxkbcommon-dev \
           libssl-dev
     - name: Install Rust toolchain
+      # Pinned rather than tracking stable, so that a new release of clippy
+      # cannot start failing CI on a commit that did not change. Bump this
+      # deliberately.
       run: |
-        rustup toolchain install stable --component clippy,rustfmt
-        rustup default stable
+        rustup toolchain install 1.98.0 --component clippy,rustfmt
+        rustup override set 1.98.0
     - name: Verify Rust version
       run: |
         rustc --version
@@ -35,7 +38,7 @@ jobs:
         curl -L https://github.com/casey/just/releases/download/1.50.0/just-1.50.0-x86_64-unknown-linux-musl.tar.gz | tar xzf - -C ~/.just
         echo "$HOME/.just" >> "$GITHUB_PATH"
     - name: Cache
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/
