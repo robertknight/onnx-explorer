@@ -127,18 +127,18 @@ impl Canvas {
         self.clamp_pan(viewport, layout.bounds);
         self.draw(ui, viewport, layout, selected);
 
-        if response.clicked() {
-            if let Some(pointer) = response.interact_pointer_pos() {
-                let scene = self.to_scene(viewport, pointer);
-                let hit = layout
-                    .nodes
-                    .iter()
-                    .position(|node| node.rect.contains(scene));
-                return match hit {
-                    Some(index) => CanvasEvent::Selected(index),
-                    None => CanvasEvent::Cleared,
-                };
-            }
+        if response.clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let scene = self.to_scene(viewport, pointer);
+            let hit = layout
+                .nodes
+                .iter()
+                .position(|node| node.rect.contains(scene));
+            return match hit {
+                Some(index) => CanvasEvent::Selected(index),
+                None => CanvasEvent::Cleared,
+            };
         }
 
         CanvasEvent::None
@@ -273,22 +273,20 @@ impl Canvas {
 
         self.simplified = visible_nodes.len() > MAX_DRAWN_NODES;
 
+        let surface = Surface {
+            painter: &painter,
+            viewport,
+            palette: &palette,
+        };
+
         if self.simplified {
-            self.draw_density(&painter, viewport, layout, &visible_nodes, &palette);
+            self.draw_density(surface, layout, &visible_nodes);
             return;
         }
 
         let (highlight_edges, highlight_nodes) = self.highlights(layout, selected);
-        self.draw_edges(&painter, viewport, layout, visible, &highlight_edges, &palette);
-        self.draw_nodes(
-            &painter,
-            viewport,
-            layout,
-            &visible_nodes,
-            selected,
-            &highlight_nodes,
-            &palette,
-        );
+        self.draw_edges(surface, layout, visible, &highlight_edges);
+        self.draw_nodes(surface, layout, &visible_nodes, selected, &highlight_nodes);
     }
 
     /// Edges and nodes adjacent to the selection, which are drawn emphasised.
@@ -314,13 +312,16 @@ impl Canvas {
 
     fn draw_edges(
         &self,
-        painter: &egui::Painter,
-        viewport: Rect,
+        surface: Surface,
         layout: &Layout,
         visible: Rect,
         highlighted: &HashSet<usize>,
-        palette: &Palette,
     ) {
+        let Surface {
+            painter,
+            viewport,
+            palette,
+        } = surface;
         let width = (1.1 * self.zoom).clamp(0.7, 2.0);
         let mut drawn = 0;
 
@@ -347,10 +348,10 @@ impl Canvas {
                 .collect();
             painter.add(Shape::line(points.clone(), stroke));
 
-            if self.zoom >= ZOOM_SHOW_TITLE {
-                if let [.., before, tip] = points.as_slice() {
-                    arrow_head(painter, *tip, *before, 7.0 * self.zoom, stroke.color);
-                }
+            if self.zoom >= ZOOM_SHOW_TITLE
+                && let [.., before, tip] = points.as_slice()
+            {
+                arrow_head(painter, *tip, *before, 7.0 * self.zoom, stroke.color);
             }
 
             if self.zoom >= ZOOM_SHOW_EDGE_LABELS && !edge.label.is_empty() {
@@ -368,14 +369,17 @@ impl Canvas {
 
     fn draw_nodes(
         &self,
-        painter: &egui::Painter,
-        viewport: Rect,
+        surface: Surface,
         layout: &Layout,
         visible_nodes: &[usize],
         selected: Option<usize>,
         highlighted: &HashSet<usize>,
-        palette: &Palette,
     ) {
+        let Surface {
+            painter,
+            viewport,
+            palette,
+        } = surface;
         let radius = (4.0 * self.zoom).clamp(0.0, 6.0) as u8;
         let show_title = self.zoom >= ZOOM_SHOW_TITLE;
         let show_subtitle = self.zoom >= ZOOM_SHOW_SUBTITLE;
@@ -439,14 +443,12 @@ impl Canvas {
     /// At this zoom a node covers a pixel or two, so plotting how many fall in
     /// each cell shows the shape of the model at a fraction of the cost, and
     /// reads more clearly than thousands of overlapping slivers.
-    fn draw_density(
-        &mut self,
-        painter: &egui::Painter,
-        viewport: Rect,
-        layout: &Layout,
-        visible_nodes: &[usize],
-        palette: &Palette,
-    ) {
+    fn draw_density(&mut self, surface: Surface, layout: &Layout, visible_nodes: &[usize]) {
+        let Surface {
+            painter,
+            viewport,
+            palette,
+        } = surface;
         let columns = (viewport.width() / DENSITY_CELL).ceil().max(1.0) as usize;
         let rows = (viewport.height() / DENSITY_CELL).ceil().max(1.0) as usize;
 
@@ -505,6 +507,15 @@ fn arrow_head(painter: &egui::Painter, tip: Pos2, from: Pos2, size: f32, color: 
         color,
         Stroke::NONE,
     ));
+}
+
+/// The target the drawing helpers paint onto. Bundled so that they take a
+/// destination rather than repeating three arguments apiece.
+#[derive(Copy, Clone)]
+struct Surface<'a> {
+    painter: &'a egui::Painter,
+    viewport: Rect,
+    palette: &'a Palette,
 }
 
 struct Palette {
@@ -595,7 +606,7 @@ fn clamp_axis(pan: f32, min: f32, max: f32, size: f32, keep: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_axis, KEEP_VISIBLE};
+    use super::{KEEP_VISIBLE, clamp_axis};
 
     #[test]
     fn test_clamp_axis_allows_free_movement_in_range() {
@@ -633,6 +644,9 @@ mod tests {
         let top = clamp_axis(1e9, 0.0, 100_000.0, 800.0, KEEP_VISIBLE);
         let bottom = clamp_axis(-1e9, 0.0, 100_000.0, 800.0, KEEP_VISIBLE);
         assert!(top > bottom);
-        assert!(bottom <= -99_000.0, "should reach the far end, got {bottom}");
+        assert!(
+            bottom <= -99_000.0,
+            "should reach the far end, got {bottom}"
+        );
     }
 }

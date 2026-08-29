@@ -292,10 +292,7 @@ mod tests {
 
         // From the root, `/Shape` is drawn directly and the rest are folded
         // into their top-level blocks.
-        assert!(matches!(
-            hierarchy.placement(root, top),
-            Placement::Direct
-        ));
+        assert!(matches!(hierarchy.placement(root, top), Placement::Direct));
         let layers0 = hierarchy.group(root).children[0];
         assert!(matches!(
             hierarchy.placement(root, attn_node),

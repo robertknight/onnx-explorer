@@ -105,9 +105,12 @@ fn main() -> ExitCode {
 
 /// Lay out every graph in the model and report how long each took.
 fn print_layout_timings(model: &Model, file_name: &str, load_time: std::time::Duration) {
-    use crate::layout::{layout_graph, LayoutOptions};
+    use crate::layout::{LayoutOptions, layout_graph};
 
-    println!("{file_name}  (parsed in {:.1} ms)", load_time.as_secs_f64() * 1000.0);
+    println!(
+        "{file_name}  (parsed in {:.1} ms)",
+        load_time.as_secs_f64() * 1000.0
+    );
     let opts = LayoutOptions::default();
     let mut total = std::time::Duration::ZERO;
 
@@ -155,11 +158,17 @@ fn print_layout_timings(model: &Model, file_name: &str, load_time: std::time::Du
 /// Print an overview of the model, for use from the terminal and as a way to
 /// sanity check parsing without opening a window.
 fn print_summary(model: &Model, file_name: &str, load_time: std::time::Duration) {
-    println!("{file_name}  (loaded in {:.1} ms)", load_time.as_secs_f64() * 1000.0);
+    println!(
+        "{file_name}  (loaded in {:.1} ms)",
+        load_time.as_secs_f64() * 1000.0
+    );
 
     if let Some(producer) = &model.producer_name {
         let version = model.producer_version.as_deref().unwrap_or("");
-        println!("  producer:   {}", format!("{producer} {version}").trim_end());
+        println!(
+            "  producer:   {}",
+            format!("{producer} {version}").trim_end()
+        );
     }
     if let Some(ir_version) = model.ir_version {
         println!("  ir version: {ir_version}");

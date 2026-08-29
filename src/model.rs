@@ -450,7 +450,9 @@ pub enum TensorData {
     Int64s(Vec<i64>),
     Doubles(Vec<f64>),
     /// Data lives in a separate file, described by these key/value entries.
-    External { entries: Vec<(String, String)> },
+    External {
+        entries: Vec<(String, String)>,
+    },
     Missing,
 }
 
@@ -656,12 +658,7 @@ impl Builder {
         }
     }
 
-    fn build_attr(
-        &mut self,
-        proto: AttributeProto,
-        graph_id: GraphId,
-        op_type: &str,
-    ) -> Attribute {
+    fn build_attr(&mut self, proto: AttributeProto, graph_id: GraphId, op_type: &str) -> Attribute {
         let AttributeProto {
             name,
             f,
@@ -795,10 +792,10 @@ fn decompose_type(ty: TypeProto) -> (Option<DataType>, Option<Shape>) {
         });
         return (tensor.elem_type, shape);
     }
-    if let Some(seq) = ty.sequence {
-        if let Some(elem) = seq.elem_type {
-            return decompose_type(elem);
-        }
+    if let Some(seq) = ty.sequence
+        && let Some(elem) = seq.elem_type
+    {
+        return decompose_type(elem);
     }
     (None, None)
 }
@@ -1139,18 +1136,23 @@ mod tests {
         assert_eq!(outer.kind, ValueKind::OuterScope);
         let target = outer.outer.expect("outer scope value should be resolved");
         assert_eq!(target.graph, model.root_id());
-        assert_eq!(
-            model.graph(target.graph).value(target.value).name,
-            "outer"
-        );
+        assert_eq!(model.graph(target.graph).value(target.value).name, "outer");
     }
 
     #[test]
     fn test_symbolic_dimensions() {
         let mut info = value_info("x", &[1, 4]);
         // Replace the first dimension with a symbolic one.
-        info.r#type.as_mut().unwrap().tensor_type.as_mut().unwrap()
-            .shape.as_mut().unwrap().dim[0] = Dimension {
+        info.r#type
+            .as_mut()
+            .unwrap()
+            .tensor_type
+            .as_mut()
+            .unwrap()
+            .shape
+            .as_mut()
+            .unwrap()
+            .dim[0] = Dimension {
             dim_value: None,
             dim_param: Some("batch".to_string()),
         };
@@ -1183,7 +1185,10 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(model.root().op_type_counts(), vec![("Relu", 3), ("Conv", 1)]);
+        assert_eq!(
+            model.root().op_type_counts(),
+            vec![("Relu", 3), ("Conv", 1)]
+        );
     }
 
     #[test]

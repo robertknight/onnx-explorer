@@ -683,16 +683,16 @@ fn transpose(
     while improved && rounds < 4 {
         improved = false;
         rounds += 1;
-        for rank in 0..members.len() {
-            for position in 0..members[rank].len().saturating_sub(1) {
-                let left = members[rank][position];
-                let right = members[rank][position + 1];
+        for rank in members.iter_mut() {
+            for position in 0..rank.len().saturating_sub(1) {
+                let left = rank[position];
+                let right = rank[position + 1];
                 let before = crossings(cells, &preds[left], &preds[right])
                     + crossings(cells, &succs[left], &succs[right]);
                 let after = crossings(cells, &preds[right], &preds[left])
                     + crossings(cells, &succs[right], &succs[left]);
                 if after < before {
-                    members[rank].swap(position, position + 1);
+                    rank.swap(position, position + 1);
                     cells[left].order = position + 1;
                     cells[right].order = position;
                     improved = true;
@@ -885,9 +885,9 @@ fn build_edges(
             }
             points.push(top_centre(&nodes[link.to].rect));
 
-            let bounds = points
-                .iter()
-                .fold(Rect::NOTHING, |bounds, point| bounds.union(Rect::from_center_size(*point, Vec2::ZERO)));
+            let bounds = points.iter().fold(Rect::NOTHING, |bounds, point| {
+                bounds.union(Rect::from_center_size(*point, Vec2::ZERO))
+            });
 
             LayoutEdge {
                 from: link.from,
@@ -924,7 +924,7 @@ fn bounds_of(nodes: &[LayoutNode], edges: &[LayoutEdge]) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{isotonic, ItemKind, LayoutOptions, Scope, layout_graph};
+    use super::{ItemKind, LayoutOptions, Scope, isotonic, layout_graph};
     use crate::hierarchy::Hierarchy;
     use crate::model::Model;
     use rten_onnx::onnx::{GraphProto, ModelProto, NodeProto, ValueInfoProto};
@@ -1020,7 +1020,12 @@ mod tests {
         // A fan-out to many nodes, all of which share a rank.
         let mut nodes = vec![node("Relu", "root", &["x"], &["h"])];
         for i in 0..24 {
-            nodes.push(node("Mul", &format!("leaf{i}"), &["h"], &[&format!("o{i}")]));
+            nodes.push(node(
+                "Mul",
+                &format!("leaf{i}"),
+                &["h"],
+                &[&format!("o{i}")],
+            ));
         }
 
         let model = model(GraphProto {
@@ -1068,9 +1073,7 @@ mod tests {
         let skip = layout
             .edges
             .iter()
-            .find(|e| {
-                layout.nodes[e.from].subtitle == "a" && layout.nodes[e.to].subtitle == "d"
-            })
+            .find(|e| layout.nodes[e.from].subtitle == "a" && layout.nodes[e.to].subtitle == "d")
             .expect("skip connection should be present");
 
         // Endpoints plus one bend per intervening rank.
@@ -1105,10 +1108,7 @@ mod tests {
 
         let layout = layout_graph(model.root(), None, &LayoutOptions::default());
         assert!(
-            layout
-                .nodes
-                .iter()
-                .all(|n| n.title != "Constant"),
+            layout.nodes.iter().all(|n| n.title != "Constant"),
             "constant nodes should be folded away"
         );
         // The input and the Mul remain, connected by one edge.
@@ -1164,11 +1164,7 @@ mod tests {
         );
 
         // A block's box reports everything nested inside it.
-        let layer0 = layout
-            .nodes
-            .iter()
-            .find(|n| n.title == "layers.0")
-            .unwrap();
+        let layer0 = layout.nodes.iter().find(|n| n.title == "layers.0").unwrap();
         assert_eq!(layer0.subtitle, "3 nodes");
 
         // x -> embed -> layers.0 -> layers.1 -> y. The two edges inside

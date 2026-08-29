@@ -197,11 +197,13 @@ impl App {
             return;
         }
 
-        if let Some(group) = self.active_hierarchy().map(|h| h.group_of(id)) {
-            if group != self.scope {
-                self.scope = group;
-                self.canvas.request_home();
-            }
+        // Read the group before mutating, so the hierarchy borrow ends first.
+        let group = self.active_hierarchy().map(|h| h.group_of(id));
+        if let Some(group) = group
+            && group != self.scope
+        {
+            self.scope = group;
+            self.canvas.request_home();
         }
 
         // The block may have just changed, so the drawing to focus within may
@@ -440,10 +442,7 @@ impl App {
                     .on_hover_text("Group operators by the structure in their names")
                     .changed();
                 if parent.is_some() {
-                    up = ui
-                        .button("Up")
-                        .on_hover_text("Leave this block")
-                        .clicked();
+                    up = ui.button("Up").on_hover_text("Leave this block").clicked();
                 }
             }
 
@@ -470,22 +469,20 @@ impl App {
             self.selection = None;
             self.canvas.request_home();
         }
-        if up {
-            if let Some(parent) = parent {
-                let left = self.scope;
-                self.enter_group(parent);
-                // Come back out looking at the block just left, rather than at
-                // the top of an unfamiliar drawing.
-                self.ensure_layout();
-                let key = self.view_key();
-                let rect = self.layouts.get(&key).and_then(|layout| {
-                    layout
-                        .group_index(left)
-                        .map(|index| layout.nodes[index].rect)
-                });
-                if let Some(rect) = rect {
-                    self.canvas.focus_on(rect);
-                }
+        if up && let Some(parent) = parent {
+            let left = self.scope;
+            self.enter_group(parent);
+            // Come back out looking at the block just left, rather than at the
+            // top of an unfamiliar drawing.
+            self.ensure_layout();
+            let key = self.view_key();
+            let rect = self.layouts.get(&key).and_then(|layout| {
+                layout
+                    .group_index(left)
+                    .map(|index| layout.nodes[index].rect)
+            });
+            if let Some(rect) = rect {
+                self.canvas.focus_on(rect);
             }
         }
         // Toggling or moving up may have selected a view with no layout yet.
@@ -498,10 +495,9 @@ impl App {
         let layout = &self.layouts[&key];
         let selected_index = match self.selection {
             Some(Selection::Node(id)) => layout.node_index(id),
-            Some(Selection::Value(id)) => layout
-                .nodes
-                .iter()
-                .position(|node| matches!(node.kind, ItemKind::Input(v) | ItemKind::Output(v) if v == id)),
+            Some(Selection::Value(id)) => layout.nodes.iter().position(
+                |node| matches!(node.kind, ItemKind::Input(v) | ItemKind::Output(v) if v == id),
+            ),
             None => None,
         };
         let event = self.canvas.show(ui, layout, selected_index);
@@ -595,7 +591,6 @@ impl App {
                         }
                     }
                 }
-
             });
 
         if let Some(id) = enter {
@@ -651,7 +646,6 @@ impl App {
                         }
                     }
                 }
-
             });
 
         if let Some(subgraph_id) = goto {
@@ -739,8 +733,7 @@ impl App {
                                     ui.label(RichText::new(attr.value.type_name()).weak());
                                     match attr.value {
                                         AttrValue::Graph(subgraph_id) => {
-                                            let count =
-                                                self.model.graph(subgraph_id).nodes().len();
+                                            let count = self.model.graph(subgraph_id).nodes().len();
                                             if ui.link(format!("open ({count} nodes)")).clicked() {
                                                 goto_graph = Some(subgraph_id);
                                             }
