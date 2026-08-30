@@ -179,7 +179,8 @@ pub fn layout_graph(graph: &Graph, scope: Option<Scope>, opts: &LayoutOptions) -
         links,
     } = collected;
 
-    let ranks = assign_ranks(nodes.len(), &links);
+    let mut ranks = assign_ranks(nodes.len(), &links);
+    sink_constant_fed(&mut ranks, &links, &constant_fed(graph, scope, &nodes));
 
     // Build the cell graph, inserting dummies for edges spanning several ranks.
     let mut cells: Vec<Cell> = nodes
@@ -552,6 +553,97 @@ fn assign_ranks(count: usize, links: &[Link]) -> Vec<usize> {
     }
 
     rank
+}
+
+/// Mark the drawn boxes that stand for work on constants alone.
+///
+/// A block counts only if everything inside it does, since the block is drawn
+/// as one box and moves as one.
+fn constant_fed(graph: &Graph, scope: Option<Scope>, nodes: &[LayoutNode]) -> Vec<bool> {
+    let by_node = graph.constant_fed_nodes();
+    nodes
+        .iter()
+        .map(|node| match node.kind {
+            ItemKind::Op(id) => by_node[id.0 as usize],
+            ItemKind::Group(group) => {
+                scope.is_some_and(|scope| group_is_constant_fed(scope.hierarchy, group, &by_node))
+            }
+            ItemKind::Input(_) | ItemKind::Output(_) => false,
+        })
+        .collect()
+}
+
+fn group_is_constant_fed(hierarchy: &Hierarchy, group: GroupId, by_node: &[bool]) -> bool {
+    let group = hierarchy.group(group);
+    group.nodes.iter().all(|id| by_node[id.0 as usize])
+        && group
+            .children
+            .iter()
+            .all(|child| group_is_constant_fed(hierarchy, *child, by_node))
+}
+
+/// Move boxes that only work on constants down to just above their first
+/// consumer.
+///
+/// Longest-path layering puts everything without a predecessor in the top rank.
+/// A shape computation or a generated mask therefore starts at the top of the
+/// drawing, however far down the node that uses it sits, leaving an edge
+/// stretched across the whole graph. These boxes have no path back to a graph
+/// input, so nothing is holding them up there.
+///
+/// Boxes are lowered in reverse rank order so that a chain of them collapses in
+/// one pass: each is placed against a successor that has already moved.
+fn sink_constant_fed(ranks: &mut [usize], links: &[Link], constant_fed: &[bool]) {
+    if !constant_fed.iter().any(|fed| *fed) {
+        return;
+    }
+
+    let mut order: Vec<usize> = (0..ranks.len())
+        .filter(|index| constant_fed[*index])
+        .collect();
+    order.sort_by_key(|index| std::cmp::Reverse(ranks[*index]));
+
+    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); ranks.len()];
+    for link in links {
+        if link.from != link.to {
+            consumers[link.from].push(link.to);
+        }
+    }
+
+    for index in order {
+        let lowest = consumers[index]
+            .iter()
+            .map(|consumer| ranks[*consumer])
+            .min();
+        // A consumer is always at least one rank down, but a broken cycle could
+        // leave one level with or above this box, so clamp.
+        if let Some(consumer) = lowest {
+            ranks[index] = consumer.saturating_sub(1);
+        }
+    }
+
+    compact_ranks(ranks);
+}
+
+/// Close up ranks left empty by [`sink_sources`], which would otherwise be
+/// drawn as a band of blank space.
+fn compact_ranks(ranks: &mut [usize]) {
+    let Some(&highest) = ranks.iter().max() else {
+        return;
+    };
+    let mut occupied = vec![false; highest + 1];
+    for &rank in ranks.iter() {
+        occupied[rank] = true;
+    }
+    let mut renumbered = vec![0usize; highest + 1];
+    let mut next = 0;
+    for (rank, used) in occupied.iter().enumerate() {
+        renumbered[rank] = next;
+        next += usize::from(*used);
+    }
+    for rank in ranks.iter_mut() {
+        *rank = renumbered[*rank];
+    }
 }
 
 /// Create the chain of cells an edge passes through, adding a dummy for each
@@ -1107,6 +1199,62 @@ mod tests {
     }
 
     #[test]
+    fn test_constant_fed_nodes_sink_to_their_consumer() {
+        // A chain of four, with a pair of nodes working on a constant alone and
+        // feeding the last of them. Ranked by longest path those two sit at the
+        // top, a whole graph away from their only consumer.
+        let constant = NodeProto {
+            op_type: Some("Constant".to_string()),
+            name: Some("k".to_string()),
+            output: vec!["c".to_string()],
+            attribute: vec![rten_onnx::onnx::AttributeProto {
+                name: Some("value".to_string()),
+                t: Some(rten_onnx::onnx::TensorProto {
+                    name: Some("c".to_string()),
+                    dims: vec![2],
+                    data_type: Some(DataType::FLOAT),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let model = model(GraphProto {
+            node: vec![
+                constant,
+                node("Mul", "const_chain", &["c", "c"], &["m"]),
+                node("Reshape", "fed_by_const", &["m"], &["r"]),
+                node("Relu", "a", &["x"], &["h1"]),
+                node("Relu", "b", &["h1"], &["h2"]),
+                node("Relu", "c2", &["h2"], &["h3"]),
+                node("Add", "last", &["h3", "r"], &["y"]),
+            ],
+            input: vec![value_info("x")],
+            ..Default::default()
+        });
+
+        let layout = layout_graph(model.root(), None, &LayoutOptions::default());
+        let head = box_for(&layout, model.root(), "const_chain");
+        let fed = box_for(&layout, model.root(), "fed_by_const");
+        let last = box_for(&layout, model.root(), "last");
+        let first = box_for(&layout, model.root(), "a");
+
+        assert!(
+            fed.rect.min.y > first.rect.min.y,
+            "constant-fed node should not stay in the top rank"
+        );
+        assert!(
+            fed.rect.max.y < last.rect.min.y,
+            "constant-fed node should stay above its consumer"
+        );
+        // The whole chain moves, not just the box nearest the consumer.
+        assert!(
+            head.rect.min.y > first.rect.min.y && head.rect.max.y < fed.rect.min.y,
+            "the rest of the constant-fed chain should follow it down"
+        );
+    }
+
+    #[test]
     fn test_long_edges_are_routed_through_dummies() {
         // A skip connection from the first node to the last, spanning 3 ranks.
         let model = model(GraphProto {
@@ -1377,6 +1525,22 @@ mod tests {
             input.subtitle,
             input.rect.width()
         );
+    }
+
+    #[test]
+    fn test_compact_ranks_closes_gaps() {
+        let mut ranks = vec![0, 3, 3, 5];
+        super::compact_ranks(&mut ranks);
+        assert_eq!(ranks, [0, 1, 1, 2]);
+
+        // Already contiguous ranks are left alone.
+        let mut ranks = vec![2, 0, 1, 2];
+        super::compact_ranks(&mut ranks);
+        assert_eq!(ranks, [2, 0, 1, 2]);
+
+        let mut ranks: Vec<usize> = Vec::new();
+        super::compact_ranks(&mut ranks);
+        assert!(ranks.is_empty());
     }
 
     #[test]

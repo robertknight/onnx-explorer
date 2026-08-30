@@ -202,6 +202,33 @@ impl Graph {
         &self.nodes
     }
 
+    /// Mark each node whose inputs are all constants, or come from other such
+    /// nodes, indexed by [`NodeId`].
+    ///
+    /// These are the parts of a graph that could be evaluated ahead of time:
+    /// shape computations, reshape targets, generated masks and the like. They
+    /// have no path back to a graph input, so nothing anchors them to a
+    /// position in the drawing.
+    pub fn constant_fed_nodes(&self) -> Vec<bool> {
+        // ONNX requires nodes to be listed in topological order, so a single
+        // forward pass sees every producer before its consumers. A model that
+        // breaks the rule just yields a few missed nodes.
+        let mut constant_fed = vec![false; self.nodes.len()];
+        for node in &self.nodes {
+            constant_fed[node.id.0 as usize] = node.inputs.iter().all(|input| match input {
+                None => true,
+                Some(value_id) => {
+                    let value = self.value(*value_id);
+                    value.is_constant()
+                        || value
+                            .producer
+                            .is_some_and(|producer| constant_fed[producer.0 as usize])
+                }
+            });
+        }
+        constant_fed
+    }
+
     pub fn value(&self, id: ValueId) -> &Value {
         &self.values[id.0 as usize]
     }
@@ -1385,6 +1412,33 @@ mod tests {
         ] {
             assert_eq!(OpCategory::of(op_type), expected, "{op_type}");
         }
+    }
+
+    #[test]
+    fn test_constant_fed_nodes_are_marked() {
+        let model = model(GraphProto {
+            node: vec![
+                node("Shape", "shape", &["w"], &["s"]),
+                node("Add", "offset", &["s", "w"], &["o"]),
+                node("Reshape", "reshape", &["x", "o"], &["y"]),
+            ],
+            input: vec![value_info("x", &[2, 2])],
+            initializer: vec![initializer("w", &[2, 2])],
+            ..Default::default()
+        });
+
+        let graph = model.root();
+        let constant_fed = graph.constant_fed_nodes();
+        let fed = |name: &str| {
+            let node = graph.nodes().iter().find(|n| n.name == name).unwrap();
+            constant_fed[node.id.0 as usize]
+        };
+
+        // Both read only the initializer, directly or through each other.
+        assert!(fed("shape"));
+        assert!(fed("offset"));
+        // This one reads a graph input, so its position is anchored.
+        assert!(!fed("reshape"));
     }
 
     #[test]

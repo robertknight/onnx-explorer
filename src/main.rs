@@ -108,12 +108,21 @@ fn print_layout_timings(model: &Model, file_name: &str, load_time: std::time::Du
     );
     let opts = LayoutOptions::default();
     let mut total = std::time::Duration::ZERO;
+    // Total drawn edge length, which is what suffers when a box is ranked far
+    // from the nodes it connects to.
+    let mut edge_length = 0.0;
 
     for graph in model.graphs() {
         let start = Instant::now();
         let layout = layout_graph(graph, None, &opts);
         let elapsed = start.elapsed();
         total += elapsed;
+        edge_length += layout
+            .edges
+            .iter()
+            .flat_map(|edge| edge.points.windows(2))
+            .map(|segment| (segment[1] - segment[0]).length())
+            .sum::<f32>();
 
         if graph.nodes().len() >= 100 {
             println!(
@@ -130,6 +139,7 @@ fn print_layout_timings(model: &Model, file_name: &str, load_time: std::time::Du
     }
 
     println!("  total layout: {:.1} ms", total.as_secs_f64() * 1000.0);
+    println!("  total edge length: {:.0}", edge_length);
 
     // The grouped view of the main graph, which is what opens by default when
     // node names carry structure.
