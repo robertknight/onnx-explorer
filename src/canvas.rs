@@ -18,6 +18,7 @@ use egui::{
 };
 
 use crate::layout::{ItemKind, Layout};
+use crate::model::OpCategory;
 use crate::text::elide;
 
 const MAX_ZOOM: f32 = 4.0;
@@ -388,7 +389,11 @@ impl Canvas {
             let rect = self.to_screen_rect(viewport, node.rect);
             let is_selected = selected == Some(index);
 
-            painter.rect_filled(rect, radius, palette.fill(node.kind, is_selected));
+            painter.rect_filled(
+                rect,
+                radius,
+                palette.fill(node.kind, node.category, is_selected),
+            );
 
             let stroke = if is_selected {
                 Stroke::new(2.0, palette.selected_stroke)
@@ -534,9 +539,25 @@ struct Surface<'a> {
     palette: &'a Palette,
 }
 
+/// Colours for the canvas.
+///
+/// The category fills are pale tints so that the text over them stays readable
+/// and no one kind of box dominates — except compute, which is the arithmetic
+/// the rest of the graph exists to feed, and is saturated enough to pick out
+/// from across a large model.
 struct Palette {
     background: Color32,
     node_fill: Color32,
+    compute_fill: Color32,
+    unary_fill: Color32,
+    binary_fill: Color32,
+    /// Shared by normalization, pooling and reduction, which all replace an
+    /// extent of a tensor with a statistic over it.
+    statistic_fill: Color32,
+    movement_fill: Color32,
+    /// Blocks keep their own hue but take the saturation and lightness of
+    /// [`Palette::compute_fill`], so a block reads as strongly as the
+    /// arithmetic it stands in for.
     group_fill: Color32,
     node_stroke: Color32,
     input_fill: Color32,
@@ -556,7 +577,12 @@ impl Palette {
             Palette {
                 background: Color32::from_rgb(24, 24, 28),
                 node_fill: Color32::from_rgb(46, 46, 54),
-                group_fill: Color32::from_rgb(58, 52, 74),
+                compute_fill: Color32::from_rgb(112, 78, 24),
+                unary_fill: Color32::from_rgb(36, 54, 58),
+                binary_fill: Color32::from_rgb(48, 53, 42),
+                statistic_fill: Color32::from_rgb(59, 44, 54),
+                movement_fill: Color32::from_rgb(42, 47, 60),
+                group_fill: Color32::from_rgb(48, 24, 112),
                 node_stroke: Color32::from_rgb(84, 84, 96),
                 input_fill: Color32::from_rgb(32, 62, 50),
                 output_fill: Color32::from_rgb(34, 50, 76),
@@ -572,7 +598,12 @@ impl Palette {
             Palette {
                 background: Color32::from_rgb(250, 250, 252),
                 node_fill: Color32::from_rgb(255, 255, 255),
-                group_fill: Color32::from_rgb(240, 234, 250),
+                compute_fill: Color32::from_rgb(252, 218, 150),
+                unary_fill: Color32::from_rgb(232, 247, 245),
+                binary_fill: Color32::from_rgb(242, 247, 230),
+                statistic_fill: Color32::from_rgb(252, 238, 243),
+                movement_fill: Color32::from_rgb(238, 242, 249),
+                group_fill: Color32::from_rgb(188, 150, 252),
                 node_stroke: Color32::from_rgb(188, 188, 200),
                 input_fill: Color32::from_rgb(226, 244, 234),
                 output_fill: Color32::from_rgb(224, 236, 252),
@@ -587,12 +618,21 @@ impl Palette {
         }
     }
 
-    fn fill(&self, kind: ItemKind, selected: bool) -> Color32 {
+    fn fill(&self, kind: ItemKind, category: Option<OpCategory>, selected: bool) -> Color32 {
         if selected {
             return self.selected_fill;
         }
         match kind {
-            ItemKind::Op(_) => self.node_fill,
+            ItemKind::Op(_) => match category {
+                Some(OpCategory::Compute) => self.compute_fill,
+                Some(OpCategory::Unary) => self.unary_fill,
+                Some(OpCategory::Binary) => self.binary_fill,
+                Some(OpCategory::Normalization | OpCategory::Pooling | OpCategory::Reduction) => {
+                    self.statistic_fill
+                }
+                Some(OpCategory::DataMovement) => self.movement_fill,
+                Some(OpCategory::Other) | None => self.node_fill,
+            },
             ItemKind::Group(_) => self.group_fill,
             ItemKind::Input(_) => self.input_fill,
             ItemKind::Output(_) => self.output_fill,

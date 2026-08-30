@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use egui::{Pos2, Rect, Vec2, pos2, vec2};
 
 use crate::hierarchy::{GroupId, Hierarchy, Placement};
-use crate::model::{Graph, NodeId, Value, ValueId};
+use crate::model::{Graph, NodeId, OpCategory, Value, ValueId};
 
 pub struct LayoutOptions {
     pub node_height: f32,
@@ -90,6 +90,9 @@ pub struct LayoutNode {
     /// Secondary label, shown when zoomed in far enough to read it. Empty for
     /// operators, which are labelled by their type alone.
     pub subtitle: String,
+    /// What kind of work the operator does, for colouring. `None` for boxes
+    /// that are not operators.
+    pub category: Option<OpCategory>,
 }
 
 pub struct LayoutEdge {
@@ -320,6 +323,7 @@ impl<'a> Collector<'a> {
             rect: Rect::from_min_size(Pos2::ZERO, vec2(width, self.opts.node_height)),
             title,
             subtitle,
+            category: None,
         });
         index
     }
@@ -383,6 +387,7 @@ impl<'a> Collector<'a> {
             return;
         }
         let index = self.push(ItemKind::Op(node_id), node.op_type.clone(), String::new());
+        self.nodes[index].category = Some(OpCategory::of(&node.op_type));
         self.node_by_id.insert(node_id, index);
     }
 

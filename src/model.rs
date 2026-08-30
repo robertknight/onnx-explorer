@@ -315,6 +315,147 @@ impl Node {
     }
 }
 
+/// Broad grouping of operators, used to colour the graph.
+///
+/// The point is to make the shape of a model readable at a glance — where the
+/// arithmetic is, and which parts are just moving tensors around — so the
+/// groups are coarse and a few operators are placed by what they are used for
+/// rather than by what they compute.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum OpCategory {
+    /// Heavy tensor arithmetic: convolutions, matrix products, attention.
+    Compute,
+    /// Elementwise functions of one tensor, including activations.
+    Unary,
+    /// Elementwise arithmetic, comparison and logic over two or more tensors.
+    Binary,
+    /// Operators that rescale a tensor against statistics over some axis.
+    Normalization,
+    /// Operators that reduce each window of a tensor to a single value.
+    Pooling,
+    /// Operators that collapse one or more axes to a statistic over them.
+    Reduction,
+    /// Operators that rearrange, slice, join or retype tensors without doing
+    /// arithmetic on the values.
+    DataMovement,
+    /// Everything else, including reductions and control flow.
+    Other,
+}
+
+impl OpCategory {
+    /// Categorize an operator by its unqualified type, eg. `Conv`.
+    pub fn of(op_type: &str) -> OpCategory {
+        match op_type {
+            "Attention" | "Conv" | "ConvInteger" | "ConvTranspose" | "DeformConv" | "Einsum"
+            | "GRU" | "Gemm" | "LSTM" | "MatMul" | "MatMulInteger" | "MultiHeadAttention"
+            | "QLinearConv" | "QLinearMatMul" | "RNN" | "RotaryEmbedding" => OpCategory::Compute,
+
+            // Fused and quantized forms of the above, mostly from the
+            // com.microsoft domain, which exported language models are full of.
+            "CausalConvWithState"
+            | "DecoderMaskedMultiHeadAttention"
+            | "DynamicQuantizeMatMul"
+            | "FusedMatMul"
+            | "GroupQueryAttention"
+            | "LinearAttention"
+            | "MatMulNBits"
+            | "PackedAttention"
+            | "PackedMultiHeadAttention"
+            | "QAttention"
+            | "SparseAttention" => OpCategory::Compute,
+
+            // Sampling a tensor at computed positions, which is closer to the
+            // arithmetic of a convolution than to a gather.
+            "GridSample" => OpCategory::Compute,
+
+            "AveragePool" | "GlobalAveragePool" | "GlobalLpPool" | "GlobalMaxPool" | "LpPool"
+            | "MaxPool" | "MaxRoiPool" | "MaxUnpool" | "RoiAlign" => OpCategory::Pooling,
+
+            "ArgMax" | "ArgMin" | "ReduceL1" | "ReduceL2" | "ReduceLogSum" | "ReduceLogSumExp"
+            | "ReduceMax" | "ReduceMean" | "ReduceMin" | "ReduceProd" | "ReduceSum"
+            | "ReduceSumSquare" => OpCategory::Reduction,
+
+            "Abs" | "Acos" | "Acosh" | "Asin" | "Asinh" | "Atan" | "Atanh" | "Ceil" | "Celu"
+            | "Clip" | "Cos" | "Cosh" | "Elu" | "Erf" | "Exp" | "Floor" | "Gelu"
+            | "HardSigmoid" | "HardSwish" | "IsInf" | "IsNaN" | "LeakyRelu" | "Log" | "Mish"
+            | "Neg" | "Not" | "PRelu" | "Reciprocal" | "Relu" | "Round" | "Selu" | "Shrink"
+            | "Sigmoid" | "Sign" | "Sin" | "Sinh" | "Softplus" | "Softsign" | "Sqrt" | "Swish"
+            | "Tan" | "Tanh" | "ThresholdedRelu" => OpCategory::Unary,
+
+            "BiasGelu" | "FastGelu" | "QuickGelu" => OpCategory::Unary,
+
+            // Broadcasting elementwise operators. `Sum`, `Mean`, `Min` and
+            // `Max` are variadic rather than strictly binary, and `Where`
+            // selects between two tensors, but they all combine whole tensors
+            // position by position in the same way.
+            "Add" | "And" | "BitShift" | "BitwiseAnd" | "BitwiseNot" | "BitwiseOr"
+            | "BitwiseXor" | "Div" | "Equal" | "Greater" | "GreaterOrEqual" | "Less"
+            | "LessOrEqual" | "Max" | "Mean" | "Min" | "Mod" | "Mul" | "Or" | "Pow" | "Sub"
+            | "Sum" | "Where" | "Xor" => OpCategory::Binary,
+
+            // Softmax is grouped here rather than with the activations: like the
+            // normalizations it divides by a statistic over an axis, and in a
+            // transformer it sits in the same place they do.
+            "BatchNormalization"
+            | "GroupNormalization"
+            | "InstanceNormalization"
+            | "LRN"
+            | "LayerNormalization"
+            | "LogSoftmax"
+            | "LpNormalization"
+            | "MeanVarianceNormalization"
+            | "RMSNormalization"
+            | "SimplifiedLayerNormalization"
+            | "SkipLayerNormalization"
+            | "SkipSimplifiedLayerNormalization"
+            | "Softmax" => OpCategory::Normalization,
+
+            // Cast and the quantization pair change how values are represented
+            // rather than rearranging them, but they read as plumbing in the
+            // same way the reshapes do.
+            "Cast"
+            | "CastLike"
+            | "Col2Im"
+            | "Compress"
+            | "Concat"
+            | "ConstantOfShape"
+            | "DepthToSpace"
+            | "DequantizeLinear"
+            | "DynamicQuantizeLinear"
+            | "Expand"
+            | "Flatten"
+            | "Gather"
+            | "GatherElements"
+            | "GatherND"
+            | "GatherBlockQuantized"
+            | "Identity"
+            | "OneHot"
+            | "Pad"
+            | "QuantizeLinear"
+            | "Range"
+            | "Reshape"
+            | "Resize"
+            | "ReverseSequence"
+            | "Scatter"
+            | "ScatterElements"
+            | "ScatterND"
+            | "Shape"
+            | "Size"
+            | "Slice"
+            | "SpaceToDepth"
+            | "Split"
+            | "Squeeze"
+            | "Tile"
+            | "Transpose"
+            | "Trilu"
+            | "Unsqueeze"
+            | "Upsample" => OpCategory::DataMovement,
+
+            _ => OpCategory::Other,
+        }
+    }
+}
+
 /// A named tensor flowing through a graph: a graph input or output, a weight,
 /// or an intermediate result.
 pub struct Value {
@@ -1207,6 +1348,43 @@ mod tests {
         );
         assert_eq!(shape.to_string(), "[batch, 4]");
         assert_eq!(x.type_summary(), "FLOAT[batch, 4]");
+    }
+
+    #[test]
+    fn test_operators_are_categorized() {
+        use super::OpCategory;
+        use super::OpCategory::{
+            Binary, Compute, DataMovement, Normalization, Other, Pooling, Reduction, Unary,
+        };
+
+        for (op_type, expected) in [
+            ("Conv", Compute),
+            ("MatMul", Compute),
+            ("MatMulNBits", Compute),
+            ("GroupQueryAttention", Compute),
+            ("MaxPool", Pooling),
+            ("GlobalAveragePool", Pooling),
+            ("Relu", Unary),
+            ("Cos", Unary),
+            ("Erf", Unary),
+            ("BatchNormalization", Normalization),
+            ("LayerNormalization", Normalization),
+            ("Softmax", Normalization),
+            ("Transpose", DataMovement),
+            ("Gather", DataMovement),
+            ("ScatterND", DataMovement),
+            ("Reshape", DataMovement),
+            ("Expand", DataMovement),
+            ("Cast", DataMovement),
+            ("Add", Binary),
+            ("Where", Binary),
+            ("ReduceMean", Reduction),
+            ("ArgMax", Reduction),
+            ("If", Other),
+            ("NoSuchOperator", Other),
+        ] {
+            assert_eq!(OpCategory::of(op_type), expected, "{op_type}");
+        }
     }
 
     #[test]
