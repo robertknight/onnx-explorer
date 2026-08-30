@@ -28,6 +28,11 @@ struct Args {
     #[argh(switch)]
     layout: bool,
 
+    /// draw the UI with the fonts bundled with the app rather than the system
+    /// UI font
+    #[argh(switch)]
+    no_system_font: bool,
+
     /// display the version
     #[argh(switch, short = 'V')]
     version: bool,
@@ -85,7 +90,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if let Err(err) = ui::run(model, file_name) {
+    if let Err(err) = ui::run(model, file_name, !args.no_system_font) {
         eprintln!("error: could not start the user interface: {err}");
         return ExitCode::FAILURE;
     }

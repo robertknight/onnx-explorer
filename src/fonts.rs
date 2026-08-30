@@ -21,14 +21,17 @@ const BOLD_FAMILY: &str = "bold";
 static REAL_BOLD: AtomicBool = AtomicBool::new(false);
 
 /// Install the UI fonts into `ctx`. Call once, before the first frame.
-pub fn install(ctx: &egui::Context) {
+///
+/// Pass `system_font` as false to keep egui's bundled fonts, which renders the
+/// same on every platform.
+pub fn install(ctx: &egui::Context, system_font: bool) {
     let mut fonts = FontDefinitions::default();
 
     // Keep egui's fonts after the system one so its emoji coverage still
     // applies to glyphs the system font is missing.
     let mut bold_family = fonts.families[&FontFamily::Proportional].clone();
 
-    if let Some((regular, bold)) = system_ui_font() {
+    if let Some((regular, bold)) = system_font.then(system_ui_font).flatten() {
         fonts
             .font_data
             .insert("system-ui".to_owned(), Arc::new(regular));

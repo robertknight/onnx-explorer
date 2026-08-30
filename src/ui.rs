@@ -14,7 +14,7 @@ use crate::model::{
 };
 use crate::text::{elide, format_count};
 
-pub fn run(model: Model, file_name: String) -> eframe::Result<()> {
+pub fn run(model: Model, file_name: String, system_font: bool) -> eframe::Result<()> {
     let title = format!("{file_name} — ONNX Explorer");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -29,7 +29,7 @@ pub fn run(model: Model, file_name: String) -> eframe::Result<()> {
         &title,
         options,
         Box::new(move |cc| {
-            fonts::install(&cc.egui_ctx);
+            fonts::install(&cc.egui_ctx, system_font);
             Ok(Box::new(app))
         }),
     )
