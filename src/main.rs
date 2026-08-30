@@ -17,49 +17,38 @@ use rten_onnx::onnx::ModelProto;
 
 use model::Model;
 
-const USAGE: &str = "\
-Usage: onnx-explorer [options] <model.onnx>
+/// Explore the structure of an ONNX model.
+#[derive(argh::FromArgs)]
+struct Args {
+    /// print a summary to the terminal instead of opening a window
+    #[argh(switch, short = 's')]
+    summary: bool,
 
-Explore the structure of an ONNX model.
+    /// lay out every graph and print timings, without opening a window
+    #[argh(switch)]
+    layout: bool,
 
-Options:
-  -s, --summary  Print a summary to the terminal instead of opening a window
-      --layout   Lay out every graph and print timings, without opening a window
-  -h, --help     Show this message
-      --version  Show the version
-";
+    /// display the version
+    #[argh(switch, short = 'V')]
+    version: bool,
+
+    /// path to the '.onnx' model to explore
+    #[argh(positional)]
+    model: Option<String>,
+}
 
 fn main() -> ExitCode {
-    let mut summary_only = false;
-    let mut layout_only = false;
-    let mut path: Option<String> = None;
+    let args: Args = argh::from_env();
 
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                print!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            "--version" => {
-                println!("onnx-explorer {}", env!("CARGO_PKG_VERSION"));
-                return ExitCode::SUCCESS;
-            }
-            "-s" | "--summary" => summary_only = true,
-            "--layout" => layout_only = true,
-            other if other.starts_with('-') => {
-                eprintln!("error: unknown option \"{other}\"");
-                return ExitCode::FAILURE;
-            }
-            other if path.is_none() => path = Some(other.to_string()),
-            _ => {
-                eprintln!("error: expected a single model path");
-                return ExitCode::FAILURE;
-            }
-        }
+    if args.version {
+        println!("onnx-explorer {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
     }
 
-    let Some(path) = path else {
-        eprint!("{USAGE}");
+    // The model is optional only so that `--version` can be used on its own.
+    let Some(path) = args.model else {
+        eprintln!("error: expected a path to an ONNX model");
+        eprintln!("Run \"onnx-explorer --help\" for usage.");
         return ExitCode::FAILURE;
     };
 
@@ -86,12 +75,12 @@ fn main() -> ExitCode {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
 
-    if summary_only {
+    if args.summary {
         print_summary(&model, &file_name, load_time);
         return ExitCode::SUCCESS;
     }
 
-    if layout_only {
+    if args.layout {
         print_layout_timings(&model, &file_name, load_time);
         return ExitCode::SUCCESS;
     }
