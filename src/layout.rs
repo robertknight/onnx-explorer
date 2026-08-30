@@ -87,7 +87,8 @@ pub struct LayoutNode {
     pub rect: Rect,
     /// Primary label: the op type, or the value name for an input or output.
     pub title: String,
-    /// Secondary label, shown when zoomed in far enough to read it.
+    /// Secondary label, shown when zoomed in far enough to read it. Empty for
+    /// operators, which are labelled by their type alone.
     pub subtitle: String,
 }
 
@@ -381,8 +382,7 @@ impl<'a> Collector<'a> {
         if node.is_constant() {
             return;
         }
-        let (op_type, name) = (node.op_type.clone(), node.name.clone());
-        let index = self.push(ItemKind::Op(node_id), op_type, name);
+        let index = self.push(ItemKind::Op(node_id), node.op_type.clone(), String::new());
         self.node_by_id.insert(node_id, index);
     }
 
@@ -935,8 +935,11 @@ fn bounds_of(nodes: &[LayoutNode], edges: &[LayoutEdge]) -> Rect {
 mod tests {
     use super::{ItemKind, LayoutOptions, Scope, isotonic, layout_graph};
     use crate::hierarchy::Hierarchy;
-    use crate::model::Model;
-    use rten_onnx::onnx::{GraphProto, ModelProto, NodeProto, ValueInfoProto};
+    use crate::model::{Graph, Model};
+    use rten_onnx::onnx::{
+        DataType, Dimension, GraphProto, ModelProto, NodeProto, TensorShapeProto, TypeProto,
+        TypeProtoTensor, ValueInfoProto,
+    };
 
     fn node(op_type: &str, name: &str, inputs: &[&str], outputs: &[&str]) -> NodeProto {
         NodeProto {
@@ -952,6 +955,43 @@ mod tests {
         ValueInfoProto {
             name: Some(name.to_string()),
             r#type: None,
+        }
+    }
+
+    /// Find the box drawn for the operator named `name`.
+    fn box_for<'a>(layout: &'a super::Layout, graph: &Graph, name: &str) -> &'a super::LayoutNode {
+        let node = graph
+            .nodes()
+            .iter()
+            .find(|node| node.name == name)
+            .expect("no such node");
+        layout
+            .nodes
+            .iter()
+            .find(|drawn| drawn.kind == ItemKind::Op(node.id))
+            .expect("node was not drawn")
+    }
+
+    /// Like [`value_info`], but with an element type and shape, which the box
+    /// for the value uses as its subtitle.
+    fn typed_value_info(name: &str, dims: &[i64]) -> ValueInfoProto {
+        ValueInfoProto {
+            name: Some(name.to_string()),
+            r#type: Some(TypeProto {
+                tensor_type: Some(TypeProtoTensor {
+                    elem_type: Some(DataType::FLOAT),
+                    shape: Some(TensorShapeProto {
+                        dim: dims
+                            .iter()
+                            .map(|dim| Dimension {
+                                dim_value: Some(*dim),
+                                dim_param: None,
+                            })
+                            .collect(),
+                    }),
+                }),
+                sequence: None,
+            }),
         }
     }
 
@@ -1046,11 +1086,8 @@ mod tests {
         let opts = LayoutOptions::default();
         let layout = layout_graph(model.root(), None, &opts);
 
-        let mut leaves: Vec<_> = layout
-            .nodes
-            .iter()
-            .filter(|n| n.subtitle.starts_with("leaf"))
-            .map(|n| n.rect)
+        let mut leaves: Vec<_> = (0..24)
+            .map(|i| box_for(&layout, model.root(), &format!("leaf{i}")).rect)
             .collect();
         assert_eq!(leaves.len(), 24);
         leaves.sort_by(|a, b| a.min.x.partial_cmp(&b.min.x).unwrap());
@@ -1079,10 +1116,13 @@ mod tests {
         });
 
         let layout = layout_graph(model.root(), None, &LayoutOptions::default());
+        let is = |index: usize, name: &str| {
+            std::ptr::eq(&layout.nodes[index], box_for(&layout, model.root(), name))
+        };
         let skip = layout
             .edges
             .iter()
-            .find(|e| layout.nodes[e.from].subtitle == "a" && layout.nodes[e.to].subtitle == "d")
+            .find(|e| is(e.from, "a") && is(e.to, "d"))
             .expect("skip connection should be present");
 
         // Endpoints plus one bend per intervening rank.
@@ -1305,28 +1345,32 @@ mod tests {
 
     #[test]
     fn test_box_is_wide_enough_for_its_subtitle() {
-        // A short op type with a long node name beneath it. Sizing from the
-        // title alone would leave the name elided in a box at minimum width.
-        let name = "block.0.attention.matmul";
+        // A short input name over a long type summary. Sizing from the title
+        // alone would leave the type elided in a box at minimum width.
         let model = model(GraphProto {
-            node: vec![node("Mul", name, &["x"], &["y"])],
-            input: vec![value_info("x")],
+            node: vec![node("Mul", "m", &["x"], &["y"])],
+            input: vec![typed_value_info("x", &[1, 128, 768, 4])],
             ..Default::default()
         });
 
         let opts = LayoutOptions::default();
         let layout = layout_graph(model.root(), None, &opts);
-        let mul = layout.nodes.iter().find(|n| n.title == "Mul").unwrap();
+        let input = layout
+            .nodes
+            .iter()
+            .find(|n| matches!(n.kind, ItemKind::Input(_)))
+            .unwrap();
 
         assert!(
-            mul.rect.width() > opts.min_node_width,
+            input.rect.width() > opts.min_node_width,
             "box should grow past its minimum, was {}",
-            mul.rect.width()
+            input.rect.width()
         );
         assert!(
-            mul.rect.width() >= name.chars().count() as f32 * opts.subtitle_char_width,
-            "box should fit the subtitle, was {}",
-            mul.rect.width()
+            input.rect.width() >= input.subtitle.chars().count() as f32 * opts.subtitle_char_width,
+            "box should fit the subtitle {:?}, was {}",
+            input.subtitle,
+            input.rect.width()
         );
     }
 
