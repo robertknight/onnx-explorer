@@ -1,6 +1,7 @@
 //! Native viewer for ONNX model graphs.
 
 mod canvas;
+mod fonts;
 mod hierarchy;
 mod layout;
 mod model;

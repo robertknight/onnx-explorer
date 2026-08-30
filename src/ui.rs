@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use egui::{Color32, RichText, TextStyle, Ui};
 
 use crate::canvas::{Canvas, CanvasEvent};
+use crate::fonts;
 use crate::hierarchy::{GroupId, Hierarchy};
 use crate::layout::{ItemKind, Layout, LayoutOptions, Scope, layout_graph};
 use crate::model::{
@@ -24,7 +25,14 @@ pub fn run(model: Model, file_name: String) -> eframe::Result<()> {
     };
 
     let app = App::new(model);
-    eframe::run_native(&title, options, Box::new(move |_cc| Ok(Box::new(app))))
+    eframe::run_native(
+        &title,
+        options,
+        Box::new(move |cc| {
+            fonts::install(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    )
 }
 
 /// Identifies one drawing: a graph, and the block within it that is open.
@@ -588,8 +596,7 @@ impl App {
                     });
 
                 if !children.is_empty() {
-                    ui.add_space(8.0);
-                    ui.strong("Blocks");
+                    section_heading(ui, "Blocks");
                     for (id, name, count) in &children {
                         if ui.link(format!("{name} ({count} operators)")).clicked() {
                             enter = Some(*id);
@@ -611,7 +618,7 @@ impl App {
             .show(ui, |ui| {
                 let graph = self.model.graph(self.graph);
 
-                ui.strong("Inputs");
+                section_heading(ui, "Inputs");
                 for value_id in &graph.inputs {
                     let value = graph.value(*value_id);
                     ui.horizontal_wrapped(|ui| {
@@ -622,8 +629,7 @@ impl App {
                     });
                 }
 
-                ui.add_space(8.0);
-                ui.strong("Outputs");
+                section_heading(ui, "Outputs");
                 for value_id in &graph.outputs {
                     let value = graph.value(*value_id);
                     ui.horizontal_wrapped(|ui| {
@@ -636,8 +642,7 @@ impl App {
 
                 let subgraphs: Vec<_> = graph.subgraphs().collect();
                 if !subgraphs.is_empty() {
-                    ui.add_space(8.0);
-                    ui.strong("Subgraphs");
+                    section_heading(ui, "Subgraphs");
                     for (node_id, attr_name, subgraph_id) in subgraphs {
                         let node = graph.node(node_id);
                         let label = format!(
@@ -689,8 +694,7 @@ impl App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.strong("Inputs");
-                    ui.add_space(2.0);
+                    section_heading(ui, "Inputs");
                     for (index, value_id) in node.inputs.iter().enumerate() {
                         match value_id {
                             Some(value_id) => {
@@ -706,9 +710,7 @@ impl App {
                         }
                     }
 
-                    ui.add_space(10.0);
-                    ui.strong("Outputs");
-                    ui.add_space(2.0);
+                    section_heading(ui, "Outputs");
                     for (index, value_id) in node.outputs.iter().enumerate() {
                         match value_id {
                             Some(value_id) => {
@@ -725,9 +727,7 @@ impl App {
                     }
 
                     if !node.attrs.is_empty() {
-                        ui.add_space(10.0);
-                        ui.strong("Attributes");
-                        ui.add_space(2.0);
+                        section_heading(ui, "Attributes");
                         egui::Grid::new("attrs")
                             .num_columns(3)
                             .spacing([12.0, 3.0])
@@ -822,8 +822,7 @@ impl App {
                             }
                         });
 
-                    ui.add_space(10.0);
-                    ui.strong("Producer");
+                    section_heading(ui, "Producer");
                     match value.producer {
                         Some(producer) => {
                             let node = graph.node(producer);
@@ -839,8 +838,7 @@ impl App {
                         }
                     }
 
-                    ui.add_space(10.0);
-                    ui.strong(format!("Consumers ({})", value.consumers.len()));
+                    section_heading(ui, format!("Consumers ({})", value.consumers.len()));
                     for consumer in &value.consumers {
                         let node = graph.node(*consumer);
                         if ui
@@ -860,6 +858,36 @@ impl App {
             self.select_node(target, true);
         }
     }
+}
+
+/// Draw a heading for a section of the details panel.
+///
+/// The sections all hold lists of similar-looking rows, so headings have to be
+/// visible at a glance while scanning down the panel: they are set in capitals,
+/// a size up from the body text and emboldened.
+///
+/// Where the platform provides no bold face (see [`fonts::has_real_bold`]) the
+/// text is drawn twice a fraction of a pixel apart, which thickens the strokes
+/// enough to read as bold.
+fn section_heading(ui: &mut Ui, text: impl Into<String>) {
+    ui.add_space(14.0);
+
+    let font = fonts::bold(TextStyle::Body.resolve(ui.style()).size * 1.1);
+    let color = ui.visuals().strong_text_color();
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.into().to_uppercase(), font, color);
+
+    let offset = if fonts::has_real_bold() {
+        egui::Vec2::ZERO
+    } else {
+        egui::vec2(0.6, 0.0)
+    };
+    let (rect, _) = ui.allocate_exact_size(galley.size() + offset, egui::Sense::hover());
+    ui.painter().galley(rect.min, galley.clone(), color);
+    ui.painter().galley(rect.min + offset, galley, color);
+
+    ui.add_space(8.0);
 }
 
 /// Colour for tensor types and shapes in the details pane.
