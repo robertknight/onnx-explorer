@@ -104,6 +104,9 @@ pub struct LayoutEdge {
     /// Bounding box of `points`, for culling.
     pub bounds: Rect,
     pub label: String,
+    /// Whether the edge spans too many ranks to be drawn in full, so only a
+    /// stub at each end is shown. See [`LayoutOptions::max_edge_span`].
+    pub elided: bool,
 }
 
 pub struct Layout {
@@ -995,12 +998,21 @@ fn build_edges(
                 bounds.union(Rect::from_center_size(*point, Vec2::ZERO))
             });
 
+            // Anything crossing intervening ranks has a dummy in its route, so
+            // a two-cell route over a gap is an edge `route` declined to lay
+            // out: too long to draw without cutting across everything between.
+            let span = cells[route[route.len() - 1]]
+                .rank
+                .saturating_sub(cells[route[0]].rank);
+            let elided = route.len() == 2 && span > 1;
+
             LayoutEdge {
                 from: link.from,
                 to: link.to,
                 points,
                 bounds,
                 label: graph.value(link.value).type_summary(),
+                elided,
             }
         })
         .collect()
@@ -1196,6 +1208,50 @@ mod tests {
                 "boxes overlap: gap was {separation}"
             );
         }
+    }
+
+    #[test]
+    fn test_over_long_edges_are_elided() {
+        // A chain with a skip connection over more ranks than the layout is
+        // willing to route through.
+        let model = model(GraphProto {
+            node: vec![
+                node("Relu", "a", &["x"], &["h1"]),
+                node("Relu", "b", &["h1"], &["h2"]),
+                node("Relu", "c", &["h2"], &["h3"]),
+                node("Relu", "d", &["h3"], &["h4"]),
+                node("Add", "e", &["h4", "h1"], &["y"]),
+            ],
+            input: vec![value_info("x")],
+            ..Default::default()
+        });
+
+        let opts = LayoutOptions {
+            max_edge_span: 2,
+            ..LayoutOptions::default()
+        };
+        let layout = layout_graph(model.root(), None, &opts);
+        let is = |index: usize, name: &str| {
+            std::ptr::eq(&layout.nodes[index], box_for(&layout, model.root(), name))
+        };
+
+        let skip = layout
+            .edges
+            .iter()
+            .find(|edge| is(edge.from, "a") && is(edge.to, "e"))
+            .expect("skip connection should be present");
+        assert!(
+            skip.elided,
+            "a skip over 3 ranks should not be drawn in full"
+        );
+        assert_eq!(skip.points.len(), 2, "an elided edge keeps just its ends");
+
+        let short = layout
+            .edges
+            .iter()
+            .find(|edge| is(edge.from, "a") && is(edge.to, "b"))
+            .expect("chain edge should be present");
+        assert!(!short.elided, "an edge between adjacent ranks is drawn");
     }
 
     #[test]

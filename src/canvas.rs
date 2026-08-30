@@ -32,6 +32,9 @@ const ZOOM_SHOW_EDGE_LABELS: f32 = 1.5;
 
 /// Most boxes drawn individually before falling back to a density plot.
 const MAX_DRAWN_NODES: usize = 6000;
+/// How far a stub for an elided edge reaches out from its node, in points.
+const STUB_LENGTH: f32 = 26.0;
+
 /// Most edges drawn before they are dropped from an overview.
 const MAX_DRAWN_EDGES: usize = 5000;
 
@@ -347,20 +350,79 @@ impl Canvas {
                 .iter()
                 .map(|point| self.to_screen(viewport, *point))
                 .collect();
+
+            let heads = self.zoom >= ZOOM_SHOW_TITLE;
+            let label = (self.zoom >= ZOOM_SHOW_EDGE_LABELS && !edge.label.is_empty())
+                .then(|| elide(&edge.label, 28));
+
+            if edge.elided {
+                self.draw_stubs(surface, &points, stroke, heads, label.as_deref());
+                continue;
+            }
+
             painter.add(Shape::line(points.clone(), stroke));
 
-            if self.zoom >= ZOOM_SHOW_TITLE
-                && let [.., before, tip] = points.as_slice()
-            {
+            if heads && let [.., before, tip] = points.as_slice() {
                 arrow_head(painter, *tip, *before, 7.0 * self.zoom, stroke.color);
             }
 
-            if self.zoom >= ZOOM_SHOW_EDGE_LABELS && !edge.label.is_empty() {
+            if let Some(label) = label {
                 painter.text(
                     polyline_middle(&points) + vec2(4.0, 0.0),
                     Align2::LEFT_CENTER,
-                    elide(&edge.label, 28),
+                    label,
                     FontId::proportional(9.0 * self.zoom),
+                    palette.text_weak,
+                );
+            }
+        }
+    }
+
+    /// Draw an edge that is too long to show in full: a short stub leaving the
+    /// source and another arriving at the target, with nothing in between.
+    ///
+    /// Drawing these in full means a straight line cutting diagonally across
+    /// everything between the two ends, and a node with many distant consumers
+    /// buries its surroundings under a fan of them. The stubs are dashed to say
+    /// that the connection continues somewhere off out of view, and carry the
+    /// value's type at both ends so the two halves can be matched up.
+    fn draw_stubs(
+        &self,
+        surface: Surface,
+        points: &[Pos2],
+        stroke: Stroke,
+        heads: bool,
+        label: Option<&str>,
+    ) {
+        let Surface {
+            painter, palette, ..
+        } = surface;
+        let ([start, ..], [.., end]) = (points, points) else {
+            return;
+        };
+
+        let length = STUB_LENGTH * self.zoom;
+        let down = vec2(0.0, length);
+        let dash = (3.0 * self.zoom).max(1.5);
+        let leaving = [*start, *start + down];
+        let arriving = [*end - down, *end];
+
+        for stub in [leaving, arriving] {
+            painter.extend(Shape::dashed_line(&stub, stroke, dash, dash));
+        }
+        if heads {
+            let head = 7.0 * self.zoom;
+            arrow_head(painter, leaving[1], leaving[0], head, stroke.color);
+            arrow_head(painter, arriving[1], arriving[0], head, stroke.color);
+        }
+        if let Some(label) = label {
+            let font = FontId::proportional(9.0 * self.zoom);
+            for stub in [leaving, arriving] {
+                painter.text(
+                    stub[1] + vec2(5.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    label,
+                    font.clone(),
                     palette.text_weak,
                 );
             }
