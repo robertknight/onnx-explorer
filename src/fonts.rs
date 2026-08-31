@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use egui::epaint::text::{FontData, FontTweak, VariationCoords};
+use egui::epaint::text::FontData;
 use egui::{FontDefinitions, FontFamily};
 
 /// Name of the font family holding the bold face.
@@ -69,6 +69,8 @@ pub fn has_real_bold() -> bool {
 /// Load the system UI font in a regular and a bold weight, if it is available.
 #[cfg(target_os = "macos")]
 fn system_ui_font() -> Option<(FontData, FontData)> {
+    use egui::epaint::text::{FontTweak, VariationCoords};
+
     // SF Pro, the macOS UI font. It is variable, so both weights come from the
     // same 8MB file: read it once and share it between the two faces.
     let bytes = std::fs::read("/System/Library/Fonts/SFNS.ttf").ok()?;
