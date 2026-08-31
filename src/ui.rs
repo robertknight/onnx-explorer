@@ -2,6 +2,7 @@
 //! and details of the selection on the right.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::Path;
 
 use egui::{Color32, RichText, TextStyle, Ui};
@@ -74,6 +75,11 @@ struct App {
 
     canvas: Canvas,
     selection: Option<Selection>,
+    /// Summaries of constant values, computed on request and kept.
+    ///
+    /// Summarizing reads every element, which for weights held in a file is the
+    /// one thing here that can take a noticeable moment.
+    stats: HashMap<(GraphId, ValueId), Result<values::Stats, String>>,
     /// What was being looked at before the current selection, most recent last.
     ///
     /// Following a link to a constant leads away from the operator that reads
@@ -107,6 +113,7 @@ impl App {
             layout_options: LayoutOptions::default(),
             canvas: Canvas::new(),
             selection: None,
+            stats: HashMap::new(),
             history: Vec::new(),
             query: String::new(),
             filtering: false,
@@ -856,6 +863,7 @@ impl App {
         let mut back = false;
 
         {
+            let graph_id = self.graph;
             let graph = self.model.graph(self.graph);
             let value = graph.value(value_id);
 
@@ -912,6 +920,15 @@ impl App {
                     if let Some(tensor) = graph.constant_tensor(value) {
                         section_heading(ui, "Values");
                         tensor_values(ui, tensor, &self.model.source_dir, value_id);
+
+                        section_heading(ui, "Stats");
+                        tensor_stats(
+                            ui,
+                            tensor,
+                            &self.model.source_dir,
+                            (graph_id, value_id),
+                            &mut self.stats,
+                        );
                     }
 
                     section_heading(ui, "Producer");
@@ -1014,6 +1031,173 @@ fn inline_value(tensor: &Tensor, base_dir: &Path) -> Option<String> {
     })
 }
 
+/// Most elements summarized without being asked.
+///
+/// Summarizing reads every element twice, so a large tensor waits for a click
+/// rather than stalling the pane the moment a value is selected. A megabyte or
+/// so of weights is quick enough not to be worth the ceremony.
+const STATS_WITHOUT_ASKING: u64 = 1 << 20;
+
+/// Height of the histogram, in points.
+const HISTOGRAM_HEIGHT: f32 = 72.0;
+
+/// Show the range, mean and distribution of a constant's values.
+///
+/// The histogram is left out where the values themselves are written out above
+/// it: a handful of numbers already shows its own distribution.
+fn tensor_stats(
+    ui: &mut Ui,
+    tensor: &Tensor,
+    base_dir: &Path,
+    key: (GraphId, ValueId),
+    cache: &mut HashMap<(GraphId, ValueId), Result<values::Stats, String>>,
+) {
+    if tensor.elem_count() == 0 {
+        return;
+    }
+
+    if let Entry::Vacant(entry) = cache.entry(key) {
+        let large = tensor.elem_count() > STATS_WITHOUT_ASKING;
+        if large
+            && !ui
+                .button("Summarize")
+                .on_hover_text("Reads every element, which takes a moment for a large tensor")
+                .clicked()
+        {
+            return;
+        }
+        entry.insert(values::stats(tensor, base_dir).map_err(|err| err.to_string()));
+    }
+
+    let stats = match &cache[&key] {
+        Ok(stats) => stats,
+        Err(message) => {
+            ui.label(RichText::new(message).weak());
+            return;
+        }
+    };
+
+    egui::Grid::new(("stats", key.1.0))
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            for (label, value) in [("Min", stats.min), ("Max", stats.max), ("Mean", stats.mean)] {
+                ui.label(label);
+                ui.monospace(format_number(value));
+                ui.end_row();
+            }
+            if stats.non_finite > 0 {
+                ui.label("Not finite");
+                ui.label(format_count(stats.non_finite));
+                ui.end_row();
+            }
+        });
+
+    if !shown_inline(tensor) {
+        ui.add_space(6.0);
+        histogram(ui, stats);
+    }
+}
+
+/// Plot the distribution as a row of bars, tallest bucket to full height.
+fn histogram(ui: &mut Ui, stats: &values::Stats) {
+    let tallest = stats.histogram.iter().copied().max().unwrap_or(0);
+    if tallest == 0 {
+        return;
+    }
+
+    let width = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, HISTOGRAM_HEIGHT), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, ui.visuals().faint_bg_color);
+
+    let buckets = stats.histogram.len();
+    let step = rect.width() / buckets as f32;
+    for (index, count) in stats.histogram.iter().enumerate() {
+        // Give a non-empty bucket a sliver of height, so that a rare value is
+        // visible next to a bucket holding everything else.
+        let fraction = *count as f32 / tallest as f32;
+        let height = if *count == 0 {
+            0.0
+        } else {
+            (rect.height() * fraction).max(1.5)
+        };
+        let left = rect.left() + step * index as f32;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(left, rect.bottom() - height),
+            egui::pos2(left + (step - 1.0).max(1.0), rect.bottom()),
+        );
+        painter.rect_filled(bar, 0.0, ui.visuals().selection.bg_fill);
+    }
+
+    // Name the bucket under the pointer, since the bars carry no scale.
+    //
+    // Opened directly rather than through `Response::on_hover_text`, which
+    // waits out the tooltip delay first. That delay suits a hint repeating what
+    // a control does; here the tooltip is the only way to read the plot, and
+    // waiting for it turns running along the bars into a series of pauses.
+    if let Some(pos) = response.hover_pos() {
+        let index = (((pos.x - rect.left()) / step) as usize).min(buckets - 1);
+        let (low, high) = stats.bucket(index);
+        let count = stats.histogram[index];
+        let share = 100.0 * count as f64 / stats.count.max(1) as f64;
+        let text = format!(
+            "{} to {}\n{} values ({share:.1}%)",
+            format_number(low),
+            format_number(high),
+            format_count(count),
+        );
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            response.id,
+            egui::PopupAnchor::Pointer,
+        )
+        // The text is laid out to fit rather than wrapped. Wrapping it would
+        // measure against the width the tooltip had on the previous frame, and
+        // each wrap makes it narrower still, so it winds itself into a column
+        // one word wide over a few frames.
+        .show(|ui| ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend)));
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format_number(stats.min)).weak().small());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(format_number(stats.max)).weak().small());
+        });
+    });
+}
+
+/// Format a summary number readably, whatever its magnitude.
+///
+/// Weights cluster near zero and biases can be tiny, so a fixed number of
+/// decimal places would show several of them as `0.000000`.
+fn format_number(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = value.abs();
+    if !(1e-4..1e7).contains(&magnitude) {
+        format!("{value:.4e}")
+    } else {
+        let text = format!("{value:.6}");
+        // Trailing zeros carry no information here.
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// Whether a tensor's values are written out rather than put behind an
+/// expander.
+///
+/// Small vectors read fine on one line. Anything external stays behind the
+/// expander however small, so that opening the pane never goes to disk.
+fn shown_inline(tensor: &Tensor) -> bool {
+    tensor.elem_count() <= INLINE_ELEMENTS
+        && tensor.dims.len() <= 1
+        && !matches!(tensor.data, TensorData::External { .. })
+}
+
 /// Largest tensor shown in full, rather than behind an expander.
 ///
 /// A vector of a few dozen numbers is worth reading at a glance; anything
@@ -1038,10 +1222,7 @@ fn tensor_values(ui: &mut Ui, tensor: &Tensor, base_dir: &Path, value_id: ValueI
         return;
     }
 
-    // Small vectors read fine on one line. Anything external stays behind the
-    // expander however small, so that opening the pane never goes to disk.
-    let external = matches!(tensor.data, TensorData::External { .. });
-    if count <= INLINE_ELEMENTS && tensor.dims.len() <= 1 && !external {
+    if shown_inline(tensor) {
         match values::read_elements(tensor, base_dir, 0, count as usize) {
             Ok(elements) => {
                 ui.horizontal_wrapped(|ui| {

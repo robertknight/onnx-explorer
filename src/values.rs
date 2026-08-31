@@ -129,6 +129,161 @@ pub fn read_elements(
     }
 }
 
+/// Read the same window as [`read_elements`], as numbers.
+///
+/// Complex values have no single number to report, so they are refused rather
+/// than summarized as something they are not.
+pub fn read_values(
+    tensor: &Tensor,
+    base_dir: &Path,
+    start: u64,
+    count: usize,
+) -> Result<Vec<f64>, ReadError> {
+    let dtype = tensor.dtype;
+    if matches!(dtype, DataType::COMPLEX64 | DataType::COMPLEX128) {
+        return Err(ReadError::UnsupportedType(dtype));
+    }
+    let start = start as usize;
+
+    match &tensor.data {
+        TensorData::Floats(values) => Ok(numbers(values, start, count)),
+        TensorData::Int32s(values) => Ok(numbers(values, start, count)),
+        TensorData::Int64s(values) => Ok(numbers(values, start, count)),
+        TensorData::Doubles(values) => Ok(numbers(values, start, count)),
+
+        TensorData::Raw(bytes) => {
+            let size = element_size(dtype).ok_or(ReadError::UnsupportedType(dtype))?;
+            let from = (start * size).min(bytes.len());
+            let to = (from + count * size).min(bytes.len());
+            Ok(decode_values(&bytes[from..to], dtype, size))
+        }
+
+        TensorData::External { .. } => {
+            let size = element_size(dtype).ok_or(ReadError::UnsupportedType(dtype))?;
+            let external = external_ref(tensor, base_dir).ok_or(ReadError::NoData)?;
+            let bytes = read_chunk(&external, (start * size) as u64, count * size)?;
+            Ok(decode_values(&bytes, dtype, size))
+        }
+
+        TensorData::Missing => Err(ReadError::NoData),
+    }
+}
+
+/// What a tensor's values look like taken together.
+pub struct Stats {
+    /// Values that went into the summary, leaving out any that are not finite.
+    pub count: u64,
+    /// Values that were left out because they are infinite or NaN. Worth
+    /// knowing: they are usually a sign that something has gone wrong.
+    pub non_finite: u64,
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    /// Counts across equal-width buckets spanning `min..=max`.
+    pub histogram: Vec<u64>,
+}
+
+impl Stats {
+    /// Range of the bucket at `index`.
+    pub fn bucket(&self, index: usize) -> (f64, f64) {
+        let width = (self.max - self.min) / self.histogram.len() as f64;
+        let low = self.min + width * index as f64;
+        (low, low + width)
+    }
+}
+
+/// How many values are read from a file at a time when summarizing.
+///
+/// Large enough that the per-read overhead disappears, small enough that a
+/// tensor of any size is summarized without holding it in memory.
+const CHUNK: usize = 64 * 1024;
+
+/// Number of histogram buckets.
+///
+/// Enough to show the shape of a distribution in a pane this narrow without the
+/// bars becoming too thin to see.
+const BUCKETS: usize = 32;
+
+/// Summarize a tensor's values.
+///
+/// Reads the whole tensor, twice: once for the range and the mean, and again to
+/// fill the buckets, which cannot be placed until the range is known. This is
+/// the one operation here whose cost grows with the size of the tensor, so it
+/// is done only when asked for and the result is kept.
+pub fn stats(tensor: &Tensor, base_dir: &Path) -> Result<Stats, ReadError> {
+    let total = tensor.elem_count();
+
+    let mut count = 0u64;
+    let mut non_finite = 0u64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+
+    for_each_chunk(tensor, base_dir, total, |values| {
+        for value in values {
+            if !value.is_finite() {
+                non_finite += 1;
+                continue;
+            }
+            count += 1;
+            sum += value;
+            min = min.min(*value);
+            max = max.max(*value);
+        }
+    })?;
+
+    if count == 0 {
+        return Err(ReadError::NoData);
+    }
+
+    let mean = sum / count as f64;
+    let width = (max - min) / BUCKETS as f64;
+    let mut histogram = vec![0u64; BUCKETS];
+
+    if width > 0.0 {
+        for_each_chunk(tensor, base_dir, total, |values| {
+            for value in values.iter().filter(|v| v.is_finite()) {
+                // The topmost value lands one past the last bucket.
+                let bucket = (((value - min) / width) as usize).min(BUCKETS - 1);
+                histogram[bucket] += 1;
+            }
+        })?;
+    } else {
+        // Every value is the same, so there is nothing to spread out.
+        histogram = vec![count];
+    }
+
+    Ok(Stats {
+        count,
+        non_finite,
+        min,
+        max,
+        mean,
+        histogram,
+    })
+}
+
+/// Walk the whole tensor a chunk at a time.
+fn for_each_chunk(
+    tensor: &Tensor,
+    base_dir: &Path,
+    total: u64,
+    mut visit: impl FnMut(&[f64]),
+) -> Result<(), ReadError> {
+    let mut start = 0u64;
+    while start < total {
+        let want = CHUNK.min((total - start) as usize);
+        let values = read_values(tensor, base_dir, start, want)?;
+        if values.is_empty() {
+            // Short of what the shape promised: the data is truncated.
+            break;
+        }
+        start += values.len() as u64;
+        visit(&values);
+    }
+    Ok(())
+}
+
 /// Read `len` bytes from `offset` within the external tensor's own span.
 ///
 /// The file is opened per call rather than held open: reads happen only while a
@@ -169,6 +324,42 @@ fn slice<T: std::fmt::Display>(values: &[T], start: usize, count: usize) -> Vec<
         .skip(start)
         .take(count)
         .map(|value| value.to_string())
+        .collect()
+}
+
+/// Widen a run of numbers for summarizing.
+///
+/// A 64-bit integer beyond 2^53 loses precision here, which is close enough for
+/// a range and a mean, and no ONNX weight is a number of that size anyway.
+fn numbers<T: Copy + AsF64>(values: &[T], start: usize, count: usize) -> Vec<f64> {
+    values
+        .iter()
+        .skip(start)
+        .take(count)
+        .map(|value| value.as_f64())
+        .collect()
+}
+
+trait AsF64 {
+    fn as_f64(&self) -> f64;
+}
+
+macro_rules! as_f64 {
+    ($($ty:ty),*) => {
+        $(impl AsF64 for $ty {
+            fn as_f64(&self) -> f64 {
+                *self as f64
+            }
+        })*
+    };
+}
+
+as_f64!(f32, f64, i32, i64);
+
+fn decode_values(bytes: &[u8], dtype: DataType, size: usize) -> Vec<f64> {
+    bytes
+        .chunks_exact(size)
+        .map(|c| element_value(c, dtype))
         .collect()
 }
 
@@ -239,6 +430,37 @@ fn element(bytes: &[u8], dtype: DataType) -> String {
             format!("{}+{}i", f64::from_le_bytes(re), f64::from_le_bytes(im))
         }
         _ => String::from("?"),
+    }
+}
+
+/// Read one element as a number, for summarizing rather than display.
+fn element_value(bytes: &[u8], dtype: DataType) -> f64 {
+    fn array<const N: usize>(bytes: &[u8]) -> [u8; N] {
+        let mut out = [0u8; N];
+        out.copy_from_slice(&bytes[..N]);
+        out
+    }
+
+    match dtype {
+        DataType::BOOL => (bytes[0] != 0) as u8 as f64,
+        DataType::INT8 => bytes[0] as i8 as f64,
+        DataType::UINT8 => bytes[0] as f64,
+        DataType::INT16 => i16::from_le_bytes(array(bytes)) as f64,
+        DataType::UINT16 => u16::from_le_bytes(array(bytes)) as f64,
+        DataType::INT32 => i32::from_le_bytes(array(bytes)) as f64,
+        DataType::UINT32 => u32::from_le_bytes(array(bytes)) as f64,
+        DataType::INT64 => i64::from_le_bytes(array(bytes)) as f64,
+        DataType::UINT64 => u64::from_le_bytes(array(bytes)) as f64,
+        DataType::FLOAT => f32::from_le_bytes(array(bytes)) as f64,
+        DataType::DOUBLE => f64::from_le_bytes(array(bytes)),
+        DataType::FLOAT16 => f16_to_f32(u16::from_le_bytes(array(bytes))) as f64,
+        DataType::BFLOAT16 => {
+            f32::from_bits((u16::from_le_bytes(array(bytes)) as u32) << 16) as f64
+        }
+        DataType::FLOAT8E4M3FN | DataType::FLOAT8E4M3FNUZ => float8(bytes[0], 4, dtype) as f64,
+        DataType::FLOAT8E5M2 | DataType::FLOAT8E5M2FNUZ => float8(bytes[0], 5, dtype) as f64,
+        DataType::FLOAT8E8M0 => (2.0f32).powi(bytes[0] as i32 - 127) as f64,
+        _ => f64::NAN,
     }
 }
 
@@ -366,6 +588,62 @@ mod tests {
             err.to_string().contains("/nowhere/weights.bin"),
             "should name the file it wanted: {err}"
         );
+    }
+
+    #[test]
+    fn test_summarizes_values() {
+        let tensor = tensor(
+            DataType::FLOAT,
+            &[5],
+            TensorData::Floats(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        );
+        let stats = super::stats(&tensor, Path::new("")).unwrap();
+
+        assert_eq!(stats.count, 5);
+        assert_eq!(stats.non_finite, 0);
+        assert_eq!((stats.min, stats.max, stats.mean), (1.0, 5.0, 3.0));
+        assert_eq!(stats.histogram.iter().sum::<u64>(), 5);
+        // The largest value belongs to the last bucket, not one past it.
+        assert_eq!(*stats.histogram.last().unwrap(), 1);
+        let (low, high) = stats.bucket(0);
+        assert_eq!(low, 1.0);
+        assert!(high > 1.0);
+    }
+
+    #[test]
+    fn test_summary_ignores_values_that_are_not_finite() {
+        let tensor = tensor(
+            DataType::FLOAT,
+            &[4],
+            TensorData::Floats(vec![1.0, f32::NAN, 3.0, f32::INFINITY]),
+        );
+        let stats = super::stats(&tensor, Path::new("")).unwrap();
+
+        assert_eq!((stats.count, stats.non_finite), (2, 2));
+        assert_eq!((stats.min, stats.max, stats.mean), (1.0, 3.0, 2.0));
+    }
+
+    #[test]
+    fn test_summary_of_constant_values() {
+        // Every value the same leaves no range to spread buckets over.
+        let tensor = tensor(DataType::FLOAT, &[3], TensorData::Floats(vec![7.0; 3]));
+        let stats = super::stats(&tensor, Path::new("")).unwrap();
+
+        assert_eq!((stats.min, stats.max, stats.mean), (7.0, 7.0, 7.0));
+        assert_eq!(stats.histogram, vec![3]);
+    }
+
+    #[test]
+    fn test_summary_reads_beyond_one_chunk() {
+        // More elements than a single read covers, so the walk has to continue.
+        let count = super::CHUNK + 1000;
+        let values: Vec<f32> = (0..count).map(|i| i as f32).collect();
+        let tensor = tensor(DataType::FLOAT, &[count as i64], TensorData::Floats(values));
+        let stats = super::stats(&tensor, Path::new("")).unwrap();
+
+        assert_eq!(stats.count, count as u64);
+        assert_eq!((stats.min, stats.max), (0.0, (count - 1) as f64));
+        assert_eq!(stats.histogram.iter().sum::<u64>(), count as u64);
     }
 
     #[test]
