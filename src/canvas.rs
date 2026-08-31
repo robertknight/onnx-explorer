@@ -95,10 +95,6 @@ impl Canvas {
         }
     }
 
-    pub fn zoom(&self) -> f32 {
-        self.zoom
-    }
-
     /// Whether the view is currently too dense to draw in full detail.
     pub fn is_simplified(&self) -> bool {
         self.simplified
@@ -475,22 +471,36 @@ impl Canvas {
             let centre = rect.center();
 
             if show_subtitle && !node.subtitle.is_empty() {
-                painter.text(
-                    pos2(centre.x, centre.y - rect.height() * 0.16),
-                    Align2::CENTER_CENTER,
+                let subtitle_size = 10.0 * self.zoom;
+                let subtitle_capacity =
+                    ((rect.width() - 10.0) / (subtitle_size * 0.56)).max(0.0) as usize;
+
+                // Centre the two lines as one block. Placing each at a fixed
+                // offset from the middle leaves uneven padding above and below,
+                // since the two are set at different sizes.
+                let title = painter.layout_no_wrap(
                     elide(&node.title, capacity),
                     FontId::proportional(title_size),
                     palette.text,
                 );
-                let subtitle_size = 10.0 * self.zoom;
-                let subtitle_capacity =
-                    ((rect.width() - 10.0) / (subtitle_size * 0.56)).max(0.0) as usize;
-                painter.text(
-                    pos2(centre.x, centre.y + rect.height() * 0.24),
-                    Align2::CENTER_CENTER,
+                let subtitle = painter.layout_no_wrap(
                     elide(&node.subtitle, subtitle_capacity),
                     FontId::proportional(subtitle_size),
-                    palette.text_weak,
+                    palette.text_subtle,
+                );
+
+                let gap = 2.0 * self.zoom;
+                let (title_size, subtitle_size) = (title.size(), subtitle.size());
+                let top = centre.y - (title_size.y + gap + subtitle_size.y) / 2.0;
+                painter.galley(
+                    pos2(centre.x - title_size.x / 2.0, top),
+                    title,
+                    palette.text,
+                );
+                painter.galley(
+                    pos2(centre.x - subtitle_size.x / 2.0, top + title_size.y + gap),
+                    subtitle,
+                    palette.text_subtle,
                 );
             } else {
                 painter.text(
@@ -631,6 +641,9 @@ struct Palette {
     density: Color32,
     text: Color32,
     text_weak: Color32,
+    /// For a box's second line. Subordinate to the title, but not as faint as
+    /// [`Palette::text_weak`], which washes out against a saturated fill.
+    text_subtle: Color32,
 }
 
 impl Palette {
@@ -655,6 +668,7 @@ impl Palette {
                 density: Color32::from_rgb(150, 160, 200),
                 text: Color32::from_rgb(226, 226, 234),
                 text_weak: Color32::from_rgb(150, 150, 162),
+                text_subtle: Color32::from_rgb(198, 198, 208),
             }
         } else {
             Palette {
@@ -676,6 +690,7 @@ impl Palette {
                 density: Color32::from_rgb(70, 80, 130),
                 text: Color32::from_rgb(28, 28, 34),
                 text_weak: Color32::from_rgb(112, 112, 124),
+                text_subtle: Color32::from_rgb(58, 58, 68),
             }
         }
     }

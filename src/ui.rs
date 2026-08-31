@@ -451,14 +451,15 @@ impl App {
                 .on_hover_text("Go to the first input, at a legible zoom")
                 .clicked();
 
+            if has_hierarchy && parent.is_some() {
+                up = ui.button("Up").on_hover_text("Leave this block").clicked();
+            }
+
             if has_hierarchy {
                 toggled = ui
                     .checkbox(&mut self.grouped, "Auto-group nodes")
                     .on_hover_text("Group operators by the structure in their names")
                     .changed();
-                if parent.is_some() {
-                    up = ui.button("Up").on_hover_text("Leave this block").clicked();
-                }
             }
 
             toggled |= ui
@@ -466,14 +467,9 @@ impl App {
                     &mut self.layout_options.hide_shape_nodes,
                     "Hide shape nodes",
                 )
-                .on_hover_text("Leave out Shape operators and the arithmetic reading them")
+                .on_hover_text("Hide Shape operators and subgraphs that process shapes")
                 .changed();
 
-            ui.label(
-                RichText::new(format_zoom(self.canvas.zoom()))
-                    .weak()
-                    .small(),
-            );
             if self.canvas.is_simplified() {
                 ui.label(
                     RichText::new("simplified view — zoom in for detail")
@@ -908,19 +904,6 @@ fn section_heading(ui: &mut Ui, text: impl Into<String>) {
 /// one.
 fn type_color(ui: &Ui) -> Color32 {
     ui.visuals().text_color()
-}
-
-/// Format the zoom level, keeping it meaningful when a very large graph is
-/// fitted to the window and the scale falls well below one percent.
-fn format_zoom(zoom: f32) -> String {
-    let percent = zoom * 100.0;
-    if percent >= 10.0 {
-        format!("{percent:.0}%")
-    } else if percent >= 1.0 {
-        format!("{percent:.1}%")
-    } else {
-        format!("{percent:.3}%")
-    }
 }
 
 /// Render one input or output row. Returns a node to navigate to if the user
