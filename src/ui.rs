@@ -580,7 +580,9 @@ impl App {
             CanvasEvent::Selected(index) => match self.layouts[&key].nodes[index].kind {
                 // Clicking a block opens it, which is the point of grouping.
                 ItemKind::Group(group) => self.enter_group(group),
-                ItemKind::Op(id) => self.go_to(Selection::Node(id)),
+                // Selected by clicking it, so it is already on screen: moving
+                // the view now would only shift the graph under the pointer.
+                ItemKind::Op(id) => self.select_node(id, false),
                 ItemKind::Input(id) | ItemKind::Output(id) => self.go_to(Selection::Value(id)),
             },
             CanvasEvent::Cleared => self.clear_selection(),
