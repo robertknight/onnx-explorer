@@ -144,6 +144,13 @@ fn print_layout_timings(model: &Model, file_name: &str, load_time: std::time::Du
     println!("  total edge length: {edge_length:.0}");
     println!("  elided edges: {elided}");
 
+    let root = model.root();
+    let shape_derived = root.shape_derived_nodes().iter().filter(|n| **n).count();
+    println!(
+        "  shape nodes: {shape_derived} of {} operators",
+        root.nodes().len()
+    );
+
     // The grouped view of the main graph, which is what opens by default when
     // node names carry structure.
     if let Some(hierarchy) = crate::hierarchy::Hierarchy::build(model.root()) {

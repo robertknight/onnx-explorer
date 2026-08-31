@@ -42,6 +42,7 @@ pub fn run(model: Model, file_name: String, system_font: bool) -> eframe::Result
 struct ViewKey {
     graph: GraphId,
     group: Option<GroupId>,
+    hide_shape_nodes: bool,
 }
 
 /// What the details pane is describing.
@@ -126,6 +127,7 @@ impl App {
         ViewKey {
             graph: self.graph,
             group: self.active_hierarchy().map(|_| self.scope),
+            hide_shape_nodes: self.layout_options.hide_shape_nodes,
         }
     }
 
@@ -458,6 +460,14 @@ impl App {
                     up = ui.button("Up").on_hover_text("Leave this block").clicked();
                 }
             }
+
+            toggled |= ui
+                .checkbox(
+                    &mut self.layout_options.hide_shape_nodes,
+                    "Hide shape nodes",
+                )
+                .on_hover_text("Leave out Shape operators and the arithmetic reading them")
+                .changed();
 
             ui.label(
                 RichText::new(format_zoom(self.canvas.zoom()))

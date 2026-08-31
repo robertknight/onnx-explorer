@@ -229,6 +229,41 @@ impl Graph {
         constant_fed
     }
 
+    /// Mark each node that exists to compute or manipulate a shape, indexed by
+    /// [`NodeId`].
+    ///
+    /// A `Shape` operator starts one of these, and the arithmetic reading its
+    /// result — the gathers, concats and casts that assemble a target shape —
+    /// continues it. The chain ends where the result meets real data, at a
+    /// `Reshape` or an `Expand`: those read a tensor as well, so they are the
+    /// point of the shape computation rather than part of it.
+    pub fn shape_derived_nodes(&self) -> Vec<bool> {
+        // As in `constant_fed_nodes`, one forward pass suffices because ONNX
+        // lists nodes in topological order.
+        let mut derived = vec![false; self.nodes.len()];
+        for node in &self.nodes {
+            if node.op_type == "Shape" {
+                derived[node.id.0 as usize] = true;
+                continue;
+            }
+
+            let mut reads_shape = false;
+            let mut only_shapes = true;
+            for value_id in node.inputs.iter().flatten() {
+                let value = self.value(*value_id);
+                if value.is_constant() {
+                    continue;
+                }
+                match value.producer {
+                    Some(producer) if derived[producer.0 as usize] => reads_shape = true,
+                    _ => only_shapes = false,
+                }
+            }
+            derived[node.id.0 as usize] = reads_shape && only_shapes;
+        }
+        derived
+    }
+
     pub fn value(&self, id: ValueId) -> &Value {
         &self.values[id.0 as usize]
     }
@@ -1439,6 +1474,37 @@ mod tests {
         assert!(fed("offset"));
         // This one reads a graph input, so its position is anchored.
         assert!(!fed("reshape"));
+    }
+
+    #[test]
+    fn test_shape_derived_nodes_are_marked() {
+        let model = model(GraphProto {
+            node: vec![
+                node("Shape", "shape", &["x"], &["s"]),
+                node("Gather", "axis", &["s", "k"], &["d"]),
+                node("Concat", "target", &["d", "k"], &["t"]),
+                node("Reshape", "reshape", &["x", "t"], &["y"]),
+                node("Relu", "relu", &["y"], &["z"]),
+            ],
+            input: vec![value_info("x", &[2, 2])],
+            initializer: vec![initializer("k", &[1])],
+            ..Default::default()
+        });
+
+        let graph = model.root();
+        let derived = graph.shape_derived_nodes();
+        let is_shape = |name: &str| {
+            let node = graph.nodes().iter().find(|n| n.name == name).unwrap();
+            derived[node.id.0 as usize]
+        };
+
+        // The chain from `Shape` through the arithmetic assembling a new shape.
+        assert!(is_shape("shape"));
+        assert!(is_shape("axis"));
+        assert!(is_shape("target"));
+        // `Reshape` reads real data as well, so the chain stops there.
+        assert!(!is_shape("reshape"));
+        assert!(!is_shape("relu"));
     }
 
     #[test]

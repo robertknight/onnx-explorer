@@ -41,6 +41,9 @@ pub struct LayoutOptions {
     /// part in ordering, which bounds the cost at the price of a few long
     /// edges cutting across the drawing.
     pub max_edge_span: usize,
+    /// Whether to leave out shape computations. See
+    /// [`Graph::shape_derived_nodes`].
+    pub hide_shape_nodes: bool,
 }
 
 impl Default for LayoutOptions {
@@ -56,6 +59,7 @@ impl Default for LayoutOptions {
             ordering_iterations: 8,
             position_iterations: 8,
             max_edge_span: 32,
+            hide_shape_nodes: false,
         }
     }
 }
@@ -264,10 +268,16 @@ struct Collected {
 /// carry no structure; they appear in the details pane of the node that reads
 /// them instead.
 fn collect<'a>(graph: &'a Graph, scope: Option<Scope<'a>>, opts: &LayoutOptions) -> Collected {
+    let hidden = if opts.hide_shape_nodes {
+        graph.shape_derived_nodes()
+    } else {
+        Vec::new()
+    };
     let mut builder = Collector {
         graph,
         scope,
         opts,
+        hidden,
         nodes: Vec::new(),
         node_by_id: HashMap::new(),
         group_by_id: HashMap::new(),
@@ -291,6 +301,9 @@ struct Collector<'a> {
     graph: &'a Graph,
     scope: Option<Scope<'a>>,
     opts: &'a LayoutOptions,
+    /// Nodes left out of the drawing, indexed by [`NodeId`]. Empty when
+    /// everything is drawn.
+    hidden: Vec<bool>,
     nodes: Vec<LayoutNode>,
     node_by_id: HashMap<NodeId, usize>,
     group_by_id: HashMap<GroupId, usize>,
@@ -352,11 +365,15 @@ impl<'a> Collector<'a> {
             Some(scope) => {
                 let group = scope.hierarchy.group(scope.group);
                 for child in &group.children {
-                    let child_group = scope.hierarchy.group(*child);
-                    let count = child_group.total_nodes;
+                    // A block of nothing but shape arithmetic disappears with
+                    // the operators inside it.
+                    let count = self.visible_in_group(scope, *child);
+                    if count == 0 {
+                        continue;
+                    }
                     let index = self.push(
                         ItemKind::Group(*child),
-                        child_group.name.clone(),
+                        scope.hierarchy.group(*child).name.clone(),
                         format!("{count} operators"),
                     );
                     self.group_by_id.insert(*child, index);
@@ -385,9 +402,32 @@ impl<'a> Collector<'a> {
         }
     }
 
+    /// Operators still drawn inside a block, counting those in its children.
+    fn visible_in_group(&self, scope: Scope, group: GroupId) -> usize {
+        let group = scope.hierarchy.group(group);
+        if self.hidden.is_empty() {
+            return group.total_nodes;
+        }
+        group
+            .nodes
+            .iter()
+            .filter(|node| !self.is_hidden(**node))
+            .count()
+            + group
+                .children
+                .iter()
+                .map(|child| self.visible_in_group(scope, *child))
+                .sum::<usize>()
+    }
+
+    /// Whether a node is left out of the drawing entirely.
+    fn is_hidden(&self, node: NodeId) -> bool {
+        self.hidden.get(node.0 as usize).copied().unwrap_or(false)
+    }
+
     fn push_op(&mut self, node_id: NodeId) {
         let node = self.graph.node(node_id);
-        if node.is_constant() {
+        if node.is_constant() || self.is_hidden(node_id) {
             return;
         }
         let index = self.push(ItemKind::Op(node_id), node.op_type.clone(), String::new());
@@ -417,6 +457,15 @@ impl<'a> Collector<'a> {
 
         for value in self.graph.values() {
             if value.is_constant() {
+                continue;
+            }
+            // Nothing draws this value's producer, so an edge for it would
+            // arrive from a boundary input box standing in for a node the view
+            // is meant to be leaving out.
+            if value
+                .producer
+                .is_some_and(|producer| self.is_hidden(producer))
+            {
                 continue;
             }
 
@@ -1208,6 +1257,42 @@ mod tests {
                 "boxes overlap: gap was {separation}"
             );
         }
+    }
+
+    #[test]
+    fn test_shape_nodes_can_be_hidden() {
+        let model = model(GraphProto {
+            node: vec![
+                node("Shape", "shape", &["x"], &["s"]),
+                node("Concat", "target", &["s", "s"], &["t"]),
+                node("Reshape", "reshape", &["x", "t"], &["y"]),
+            ],
+            input: vec![value_info("x")],
+            output: vec![value_info("y")],
+            ..Default::default()
+        });
+
+        let opts = LayoutOptions {
+            hide_shape_nodes: true,
+            ..LayoutOptions::default()
+        };
+        let layout = layout_graph(model.root(), None, &opts);
+
+        assert!(
+            layout.nodes.iter().all(|n| n.title != "Shape"),
+            "shape nodes should be left out"
+        );
+        assert!(
+            layout.nodes.iter().all(|n| n.title != "Concat"),
+            "operators reading only a shape should be left out too"
+        );
+        // The graph input, the Reshape and the graph output, and no stand-in
+        // box for the shape arithmetic that was dropped.
+        assert_eq!(layout.nodes.len(), 3);
+
+        // Drawn in full, all three operators appear.
+        let full = layout_graph(model.root(), None, &LayoutOptions::default());
+        assert_eq!(full.nodes.len(), 5);
     }
 
     #[test]
