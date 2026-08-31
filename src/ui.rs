@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
 
-use egui::{Color32, RichText, TextStyle, Ui};
+use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, TextStyle, Ui};
 
 use crate::canvas::{Canvas, CanvasEvent};
 use crate::fonts;
@@ -38,6 +38,13 @@ pub fn run(model: Model, file_name: String, system_font: bool) -> eframe::Result
         }),
     )
 }
+
+/// Leave the block currently open.
+const UP_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::ArrowUp);
+/// Open the block last looked at inside the current one.
+const DOWN_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::ArrowDown);
+/// Go back to whatever was selected before.
+const BACK_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::ArrowLeft);
 
 /// Identifies one drawing: a graph, and the block within it that is open.
 /// Layouts are cached against this, since a graph laid out at two different
@@ -75,6 +82,9 @@ struct App {
 
     canvas: Canvas,
     selection: Option<Selection>,
+    /// The block last open within each block, so that moving down goes back
+    /// the way moving up came.
+    last_child: HashMap<(GraphId, GroupId), GroupId>,
     /// Summaries of constant values, computed on request and kept.
     ///
     /// Summarizing reads every element, which for weights held in a file is the
@@ -113,6 +123,7 @@ impl App {
             layout_options: LayoutOptions::default(),
             canvas: Canvas::new(),
             selection: None,
+            last_child: HashMap::new(),
             stats: HashMap::new(),
             history: Vec::new(),
             query: String::new(),
@@ -179,9 +190,59 @@ impl App {
 
     /// Open a block, so its contents are drawn in place of its box.
     fn enter_group(&mut self, group: GroupId) {
+        // Remember the way back down. Entering a block records it against the
+        // one containing it, whether it was reached by going down into it or by
+        // coming up to it from further in.
+        let parent = self
+            .active_hierarchy()
+            .and_then(|hierarchy| hierarchy.group(group).parent);
+        if let Some(parent) = parent {
+            self.last_child.insert((self.graph, parent), group);
+        }
+
         self.scope = group;
         self.clear_selection();
         self.canvas.request_home();
+    }
+
+    /// Open a block within the one currently open.
+    ///
+    /// The block last looked at, so that this and [`go_up`](Self::go_up) walk
+    /// back down the way they came. Failing that the first block, so the
+    /// shortcut still moves rather than doing nothing.
+    fn go_down(&mut self) {
+        let remembered = self.last_child.get(&(self.graph, self.scope)).copied();
+        let target = self.active_hierarchy().and_then(|hierarchy| {
+            let children = &hierarchy.group(self.scope).children;
+            remembered
+                .filter(|group| children.contains(group))
+                .or_else(|| children.first().copied())
+        });
+        if let Some(target) = target {
+            self.enter_group(target);
+        }
+    }
+
+    /// Leave the block currently open for the one containing it.
+    fn go_up(&mut self) {
+        let Some(parent) = self.parent_group() else {
+            return;
+        };
+        let left = self.scope;
+        self.enter_group(parent);
+
+        // Come back out looking at the block just left, rather than at the top
+        // of an unfamiliar drawing.
+        self.ensure_layout();
+        let key = self.view_key();
+        let rect = self.layouts.get(&key).and_then(|layout| {
+            layout
+                .group_index(left)
+                .map(|index| layout.nodes[index].rect)
+        });
+        if let Some(rect) = rect {
+            self.canvas.focus_on(rect);
+        }
     }
 
     /// Whether the view can move up to an enclosing block.
@@ -514,7 +575,10 @@ impl App {
                 .clicked();
 
             if has_hierarchy && parent.is_some() {
-                up = ui.button("Up").on_hover_text("Leave this block").clicked();
+                up = ui
+                    .button("Up")
+                    .on_hover_text(hint(ui, "Leave this block", UP_SHORTCUT))
+                    .clicked();
             }
 
             if has_hierarchy {
@@ -540,8 +604,14 @@ impl App {
                 );
             }
         });
+        // Consumed here rather than beside each button, so that a shortcut
+        // works whether or not its button is on screen.
+        let pressed = |shortcut| ui.input_mut(|input| input.consume_shortcut(&shortcut));
         if home {
             self.canvas.request_home();
+        }
+        if pressed(BACK_SHORTCUT) {
+            self.go_back();
         }
         if toggled {
             // The drawing changes completely, so the previous view is no
@@ -550,21 +620,11 @@ impl App {
             self.clear_selection();
             self.canvas.request_home();
         }
-        if up && let Some(parent) = parent {
-            let left = self.scope;
-            self.enter_group(parent);
-            // Come back out looking at the block just left, rather than at the
-            // top of an unfamiliar drawing.
-            self.ensure_layout();
-            let key = self.view_key();
-            let rect = self.layouts.get(&key).and_then(|layout| {
-                layout
-                    .group_index(left)
-                    .map(|index| layout.nodes[index].rect)
-            });
-            if let Some(rect) = rect {
-                self.canvas.focus_on(rect);
-            }
+        if up || pressed(UP_SHORTCUT) {
+            self.go_up();
+        }
+        if pressed(DOWN_SHORTCUT) {
+            self.go_down();
         }
         // Toggling or moving up may have selected a view with no layout yet.
         self.ensure_layout();
@@ -981,6 +1041,11 @@ fn parameter_label(params: Option<&'static [(&'static str, Arity)]>, index: usiz
         .unwrap_or_else(|| format!("{index}."))
 }
 
+/// Describe what a control does and how to reach it from the keyboard.
+fn hint(ui: &Ui, description: &str, shortcut: KeyboardShortcut) -> String {
+    format!("{description}  ({})", ui.ctx().format_shortcut(&shortcut))
+}
+
 /// Draw the button returning to the previously selected item, if there is one.
 ///
 /// The label names what it goes back to, since following a chain of links can
@@ -989,11 +1054,13 @@ fn back_button(ui: &mut Ui, history: &[Selection]) -> bool {
     let Some(previous) = history.last() else {
         return false;
     };
-    let hint = match previous {
+    let description = match previous {
         Selection::Node(_) => "Back to the operator that led here",
         Selection::Value(_) => "Back to the value that led here",
     };
-    ui.button("Back").on_hover_text(hint).clicked()
+    ui.button("Back")
+        .on_hover_text(hint(ui, description, BACK_SHORTCUT))
+        .clicked()
 }
 
 /// Largest constant written out on an input or output row.
