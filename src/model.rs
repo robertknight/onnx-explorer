@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use rten_onnx::onnx::{
     self, AttributeProto, DataType, GraphProto, ModelProto, NodeProto, TensorProto, TypeProto,
@@ -42,6 +43,10 @@ pub struct Model {
     pub producer_version: Option<String>,
     pub opset_imports: Vec<OpsetImport>,
     pub metadata: Vec<(String, String)>,
+    /// Directory the model was loaded from, which weights kept in separate
+    /// files are named relative to. Empty when the model did not come from a
+    /// file on disk.
+    pub source_dir: PathBuf,
 
     graphs: Vec<Graph>,
     root: GraphId,
@@ -97,6 +102,7 @@ impl Model {
                 .into_iter()
                 .filter_map(|e| Some((e.key?, e.value.unwrap_or_default())))
                 .collect(),
+            source_dir: PathBuf::new(),
             // Every reserved slot is filled by `build_graph` before it returns.
             graphs: builder.graphs.into_iter().map(|g| g.unwrap()).collect(),
             root,
@@ -1087,10 +1093,15 @@ fn assign_value_kinds(graph: &mut Graph, is_subgraph: bool) {
         // such values are best shown as constants.
         value.kind = if value.tensor.is_some() {
             ValueKind::Initializer
-        } else if value
+        } else if let Some(tensor) = value
             .producer
-            .is_some_and(|id| nodes[id.0 as usize].is_constant())
+            .and_then(|id| nodes[id.0 as usize].constant_tensor())
         {
+            // A `Constant` node carries its weight as an attribute, and rarely
+            // has a `value_info` entry describing what it produces. The tensor
+            // is the only statement of the type, so take it from there.
+            value.dtype.get_or_insert(tensor.dtype);
+            value.shape.get_or_insert_with(|| tensor.shape());
             ValueKind::Constant
         } else if inputs.contains(&value.id) {
             ValueKind::Input
@@ -1474,6 +1485,37 @@ mod tests {
         assert!(fed("offset"));
         // This one reads a graph input, so its position is anchored.
         assert!(!fed("reshape"));
+    }
+
+    #[test]
+    fn test_constant_nodes_are_typed_from_their_tensor() {
+        // A `Constant` node with no `value_info` describing its output, which
+        // is how exporters usually write them.
+        let constant = NodeProto {
+            op_type: Some("Constant".to_string()),
+            name: Some("k".to_string()),
+            output: vec!["c".to_string()],
+            attribute: vec![AttributeProto {
+                name: Some("value".to_string()),
+                t: Some(TensorProto {
+                    name: Some("c".to_string()),
+                    dims: vec![2, 3],
+                    data_type: Some(DataType::FLOAT),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let model = model(GraphProto {
+            node: vec![constant, node("Mul", "mul", &["x", "c"], &["y"])],
+            input: vec![value_info("x", &[2, 3])],
+            ..Default::default()
+        });
+
+        let graph = model.root();
+        let value = graph.value(graph.value_by_name["c"]);
+        assert_eq!(value.type_summary(), "FLOAT[2, 3]");
     }
 
     #[test]

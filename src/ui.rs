@@ -2,6 +2,7 @@
 //! and details of the selection on the right.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use egui::{Color32, RichText, TextStyle, Ui};
 
@@ -13,6 +14,7 @@ use crate::model::{
     AttrValue, GraphId, Model, NodeId, Tensor, TensorData, Value, ValueId, ValueKind,
 };
 use crate::text::{elide, format_count};
+use crate::values;
 
 pub fn run(model: Model, file_name: String, system_font: bool) -> eframe::Result<()> {
     let title = format!("{file_name} — ONNX Explorer");
@@ -71,6 +73,11 @@ struct App {
 
     canvas: Canvas,
     selection: Option<Selection>,
+    /// What was being looked at before the current selection, most recent last.
+    ///
+    /// Following a link to a constant leads away from the operator that reads
+    /// it, and the constant has no box on the canvas to click back from.
+    history: Vec<Selection>,
     query: String,
     /// Whether the filter's matches are listed in place of the details.
     ///
@@ -99,6 +106,7 @@ impl App {
             layout_options: LayoutOptions::default(),
             canvas: Canvas::new(),
             selection: None,
+            history: Vec::new(),
             query: String::new(),
             filtering: false,
             matches: Vec::new(),
@@ -164,7 +172,7 @@ impl App {
     /// Open a block, so its contents are drawn in place of its box.
     fn enter_group(&mut self, group: GroupId) {
         self.scope = group;
-        self.selection = None;
+        self.clear_selection();
         self.canvas.request_home();
     }
 
@@ -191,10 +199,51 @@ impl App {
     fn go_to_graph(&mut self, graph: GraphId) {
         self.graph = graph;
         self.scope = GroupId(0);
-        self.selection = None;
+        self.clear_selection();
         self.canvas.request_home();
         self.ensure_hierarchy();
         self.refresh_matches();
+    }
+
+    /// Stop describing anything, discarding the trail with it.
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.history.clear();
+    }
+
+    /// Move to a selection, remembering where it was reached from.
+    fn go_to(&mut self, selection: Selection) {
+        match selection {
+            Selection::Node(id) => self.select_node(id, true),
+            Selection::Value(id) => {
+                self.remember();
+                self.selection = Some(Selection::Value(id));
+            }
+        }
+    }
+
+    /// Push the current selection onto the trail, if there is one to return to.
+    fn remember(&mut self) {
+        if let Some(current) = self.selection
+            && Some(&current) != self.history.last()
+        {
+            self.history.push(current);
+        }
+    }
+
+    /// Return to whatever was being looked at before the current selection.
+    fn go_back(&mut self) {
+        if let Some(previous) = self.history.pop() {
+            match previous {
+                // Reveal without recording, or going back would push the
+                // selection being left onto the trail and trap the two.
+                Selection::Node(id) => {
+                    self.selection = Some(Selection::Node(id));
+                    self.reveal_node(id);
+                }
+                Selection::Value(_) => self.selection = Some(previous),
+            }
+        }
     }
 
     /// Select a node, optionally bringing it into view on the canvas.
@@ -202,11 +251,16 @@ impl App {
     /// With grouping on, the node may sit inside a block that is not open, so
     /// the view moves to the block that contains it first.
     fn select_node(&mut self, id: NodeId, reveal: bool) {
+        self.remember();
         self.selection = Some(Selection::Node(id));
         if !reveal {
             return;
         }
+        self.reveal_node(id);
+    }
 
+    /// Bring a node into view, opening the block holding it if need be.
+    fn reveal_node(&mut self, id: NodeId) {
         // Read the group before mutating, so the hierarchy borrow ends first.
         let group = self.active_hierarchy().map(|h| h.group_of(id));
         if let Some(group) = group
@@ -485,7 +539,7 @@ impl App {
             // The drawing changes completely, so the previous view is no
             // longer meaningful.
             self.scope = GroupId(0);
-            self.selection = None;
+            self.clear_selection();
             self.canvas.request_home();
         }
         if up && let Some(parent) = parent {
@@ -525,12 +579,10 @@ impl App {
             CanvasEvent::Selected(index) => match self.layouts[&key].nodes[index].kind {
                 // Clicking a block opens it, which is the point of grouping.
                 ItemKind::Group(group) => self.enter_group(group),
-                ItemKind::Op(id) => self.selection = Some(Selection::Node(id)),
-                ItemKind::Input(id) | ItemKind::Output(id) => {
-                    self.selection = Some(Selection::Value(id))
-                }
+                ItemKind::Op(id) => self.go_to(Selection::Node(id)),
+                ItemKind::Input(id) | ItemKind::Output(id) => self.go_to(Selection::Value(id)),
             },
-            CanvasEvent::Cleared => self.selection = None,
+            CanvasEvent::Cleared => self.clear_selection(),
             CanvasEvent::None => {}
         }
         if !matches!(event, CanvasEvent::None) {
@@ -668,14 +720,15 @@ impl App {
             self.go_to_graph(subgraph_id);
         }
         if let Some(value_id) = select {
-            self.selection = Some(Selection::Value(value_id));
+            self.go_to(Selection::Value(value_id));
         }
     }
 
     fn node_details(&mut self, ui: &mut Ui, node_id: NodeId) {
-        let mut goto_node = None;
+        let mut goto = None;
         let mut goto_graph = None;
         let mut clear = false;
+        let mut back = false;
 
         {
             let graph = self.model.graph(self.graph);
@@ -683,6 +736,7 @@ impl App {
 
             ui.horizontal(|ui| {
                 ui.heading(node.qualified_op_type());
+                back = back_button(ui, &self.history);
                 if ui.button("Clear").clicked() {
                     clear = true;
                 }
@@ -706,8 +760,15 @@ impl App {
                             Some(value_id) => {
                                 let value = graph.value(*value_id);
                                 let constant = graph.constant_tensor(value);
-                                if let Some(target) = value_row(ui, index, value, constant, true) {
-                                    goto_node = Some(target);
+                                if let Some(target) = value_row(
+                                    ui,
+                                    index,
+                                    value,
+                                    constant,
+                                    &self.model.source_dir,
+                                    true,
+                                ) {
+                                    goto = Some(target);
                                 }
                             }
                             None => {
@@ -722,8 +783,15 @@ impl App {
                             Some(value_id) => {
                                 let value = graph.value(*value_id);
                                 let constant = graph.constant_tensor(value);
-                                if let Some(target) = value_row(ui, index, value, constant, false) {
-                                    goto_node = Some(target);
+                                if let Some(target) = value_row(
+                                    ui,
+                                    index,
+                                    value,
+                                    constant,
+                                    &self.model.source_dir,
+                                    false,
+                                ) {
+                                    goto = Some(target);
                                 }
                             }
                             None => {
@@ -760,11 +828,13 @@ impl App {
                 });
         }
 
-        if clear {
-            self.selection = None;
+        if back {
+            self.go_back();
+        } else if clear {
+            self.clear_selection();
         }
-        if let Some(target) = goto_node {
-            self.select_node(target, true);
+        if let Some(target) = goto {
+            self.go_to(target);
         }
         if let Some(graph_id) = goto_graph {
             self.go_to_graph(graph_id);
@@ -774,6 +844,7 @@ impl App {
     fn value_details(&mut self, ui: &mut Ui, value_id: ValueId) {
         let mut goto_node = None;
         let mut clear = false;
+        let mut back = false;
 
         {
             let graph = self.model.graph(self.graph);
@@ -781,6 +852,7 @@ impl App {
 
             ui.horizontal(|ui| {
                 ui.heading(elide(&value.name, 28));
+                back = back_button(ui, &self.history);
                 if ui.button("Clear").clicked() {
                     clear = true;
                 }
@@ -828,6 +900,11 @@ impl App {
                             }
                         });
 
+                    if let Some(tensor) = graph.constant_tensor(value) {
+                        section_heading(ui, "Values");
+                        tensor_values(ui, tensor, &self.model.source_dir, value_id);
+                    }
+
                     section_heading(ui, "Producer");
                     match value.producer {
                         Some(producer) => {
@@ -857,13 +934,143 @@ impl App {
                 });
         }
 
-        if clear {
-            self.selection = None;
+        if back {
+            self.go_back();
+        } else if clear {
+            self.clear_selection();
         }
         if let Some(target) = goto_node {
             self.select_node(target, true);
         }
     }
+}
+
+/// Draw the button returning to the previously selected item, if there is one.
+///
+/// The label names what it goes back to, since following a chain of links can
+/// leave it far from obvious.
+fn back_button(ui: &mut Ui, history: &[Selection]) -> bool {
+    let Some(previous) = history.last() else {
+        return false;
+    };
+    let hint = match previous {
+        Selection::Node(_) => "Back to the operator that led here",
+        Selection::Value(_) => "Back to the value that led here",
+    };
+    ui.button("Back").on_hover_text(hint).clicked()
+}
+
+/// Largest constant written out on an input or output row.
+///
+/// Enough for a shape or a per-axis parameter, and short enough to leave the
+/// row readable. Longer vectors are counted instead, and read in the value's
+/// own pane.
+const ROW_ELEMENTS: u64 = 8;
+
+/// Format a constant small enough to show on its input row, if it is one.
+///
+/// Only scalars and short vectors qualify: a matrix has no reading that fits on
+/// a line. Tensors stored outside the model file are skipped whatever their
+/// size, so that listing a node's inputs never waits on the disk.
+fn inline_value(tensor: &Tensor, base_dir: &Path) -> Option<String> {
+    let count = tensor.elem_count();
+    if count > ROW_ELEMENTS
+        || tensor.dims.len() > 1
+        || matches!(tensor.data, TensorData::External { .. })
+    {
+        return None;
+    }
+
+    let elements = values::read_elements(tensor, base_dir, 0, count as usize).ok()?;
+    if elements.is_empty() {
+        return None;
+    }
+
+    let text = elements.join(", ");
+    // A scalar is written as the bare number; ONNX gives it no dimensions.
+    Some(if tensor.dims.is_empty() {
+        text
+    } else {
+        format!("[{text}]")
+    })
+}
+
+/// Largest tensor shown in full, rather than behind an expander.
+///
+/// A vector of a few dozen numbers is worth reading at a glance; anything
+/// bigger is a wall of digits that pushes the rest of the pane off screen.
+const INLINE_ELEMENTS: u64 = 32;
+
+/// Show the elements of a constant tensor.
+///
+/// Only the rows on screen are read, so a tensor of a hundred million weights
+/// costs the same to scroll through as a small one. Weights held in a separate
+/// file are read on demand and only once expanded, which keeps a model whose
+/// data file has not been downloaded fully browsable.
+fn tensor_values(ui: &mut Ui, tensor: &Tensor, base_dir: &Path, value_id: ValueId) {
+    let count = tensor.elem_count();
+    if count == 0 {
+        ui.label(RichText::new("empty").weak());
+        return;
+    }
+
+    if let Err(err) = values::readable(tensor) {
+        ui.label(RichText::new(err.to_string()).weak());
+        return;
+    }
+
+    // Small vectors read fine on one line. Anything external stays behind the
+    // expander however small, so that opening the pane never goes to disk.
+    let external = matches!(tensor.data, TensorData::External { .. });
+    if count <= INLINE_ELEMENTS && tensor.dims.len() <= 1 && !external {
+        match values::read_elements(tensor, base_dir, 0, count as usize) {
+            Ok(elements) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.monospace(format!("[{}]", elements.join(", ")));
+                });
+            }
+            Err(err) => {
+                ui.label(RichText::new(err.to_string()).weak());
+            }
+        }
+        return;
+    }
+
+    let rows = count.min(usize::MAX as u64) as usize;
+    egui::CollapsingHeader::new(format!("{} elements", format_count(count)))
+        .id_salt(("values", value_id.0))
+        .show(ui, |ui| {
+            let row_height = ui.text_style_height(&TextStyle::Monospace);
+            egui::ScrollArea::vertical()
+                .max_height(row_height * 12.0)
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, rows, |ui, range| {
+                    let start = range.start as u64;
+                    let elements = match values::read_elements(tensor, base_dir, start, range.len())
+                    {
+                        Ok(elements) => elements,
+                        Err(err) => {
+                            ui.label(RichText::new(err.to_string()).weak());
+                            return;
+                        }
+                    };
+                    for (offset, element) in elements.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.label(
+                                RichText::new(values::index_label(
+                                    &tensor.dims,
+                                    start + offset as u64,
+                                ))
+                                .weak()
+                                .monospace(),
+                            );
+                            ui.monospace(element);
+                        });
+                    }
+                });
+        });
 }
 
 /// Draw a heading for a section of the details panel.
@@ -906,20 +1113,39 @@ fn type_color(ui: &Ui) -> Color32 {
     ui.visuals().text_color()
 }
 
-/// Render one input or output row. Returns a node to navigate to if the user
-/// clicked a link to the value's producer or consumer.
+/// Render one input or output row. Returns what to select if the user clicked
+/// the value's name, or a link to its producer or consumer.
 fn value_row(
     ui: &mut Ui,
     index: usize,
     value: &Value,
     constant: Option<&Tensor>,
+    base_dir: &Path,
     is_input: bool,
-) -> Option<NodeId> {
+) -> Option<Selection> {
     let mut target = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(RichText::new(format!("{index}.")).weak().monospace());
-        ui.monospace(elide(&value.name, 36));
+
+        // A constant written out in full says everything its name and type
+        // would, so give the space to the value and leave a link for the rest.
+        if let Some(text) = constant.and_then(|tensor| inline_value(tensor, base_dir)) {
+            ui.monospace(text);
+            if ui.link("(details)").clicked() {
+                target = Some(Selection::Value(value.id));
+            }
+            return;
+        }
+
+        // The name opens the value itself, which is the way to its stored
+        // values for a constant: those have no box on the canvas to click.
+        if ui
+            .link(RichText::new(elide(&value.name, 36)).monospace())
+            .clicked()
+        {
+            target = Some(Selection::Value(value.id));
+        }
         ui.label(RichText::new(value.type_summary()).color(type_color(ui)));
 
         match value.kind {
@@ -937,7 +1163,7 @@ fn value_row(
                 if is_input {
                     if let Some(producer) = value.producer {
                         if ui.link("← producer").clicked() {
-                            target = Some(producer);
+                            target = Some(Selection::Node(producer));
                         }
                     } else {
                         ui.label(RichText::new(value.kind.label()).color(Color32::GRAY));
@@ -949,14 +1175,14 @@ fn value_row(
                         }
                         1 => {
                             if ui.link("consumer →").clicked() {
-                                target = Some(value.consumers[0]);
+                                target = Some(Selection::Node(value.consumers[0]));
                             }
                         }
                         n => {
                             ui.label(RichText::new(format!("{n} consumers")).weak());
                             for consumer in &value.consumers {
                                 if ui.link("→").clicked() {
-                                    target = Some(*consumer);
+                                    target = Some(Selection::Node(*consumer));
                                 }
                             }
                         }

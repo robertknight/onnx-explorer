@@ -7,6 +7,7 @@ mod layout;
 mod model;
 mod text;
 mod ui;
+mod values;
 
 use std::fs::File;
 use std::path::Path;
@@ -72,7 +73,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let model = Model::from_proto(proto);
+    let mut model = Model::from_proto(proto);
+    // Weights kept outside the .onnx are named relative to it.
+    model.source_dir = Path::new(&path)
+        .parent()
+        .unwrap_or(Path::new(""))
+        .to_path_buf();
     let load_time = start.elapsed();
 
     let file_name = Path::new(&path)
