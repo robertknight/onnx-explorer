@@ -9,8 +9,9 @@ A native app for exploring [ONNX](https://onnx.ai/) model graphs. It is like
 
  - Visually explore an ONNX model and inspect the attributes of nodes
  - Loads large models very quickly
- - Automatically groups nodes into semantic blocks (embedding, head,
-   normalization, attention etc.) using information in node names
+ - Groups nodes into semantic blocks (embedding, head, normalization, attention
+   etc.) using information in node names
+ - Shows statistics and distribution of constant values
 
 ## Building
 
