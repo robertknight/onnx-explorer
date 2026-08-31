@@ -5,6 +5,7 @@ mod fonts;
 mod hierarchy;
 mod layout;
 mod model;
+mod op_schema;
 mod text;
 mod ui;
 mod values;

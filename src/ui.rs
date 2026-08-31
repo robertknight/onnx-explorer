@@ -13,6 +13,7 @@ use crate::layout::{ItemKind, Layout, LayoutOptions, Scope, layout_graph};
 use crate::model::{
     AttrValue, GraphId, Model, NodeId, Tensor, TensorData, Value, ValueId, ValueKind,
 };
+use crate::op_schema::{self, Arity};
 use crate::text::{elide, format_count};
 use crate::values;
 
@@ -754,15 +755,20 @@ impl App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    // What the operator calls each position, where its
+                    // signature is one the ONNX spec publishes.
+                    let schema = op_schema::lookup(&node.domain, &node.op_type);
+
                     section_heading(ui, "Inputs");
                     for (index, value_id) in node.inputs.iter().enumerate() {
+                        let label = parameter_label(schema.map(|s| s.inputs), index);
                         match value_id {
                             Some(value_id) => {
                                 let value = graph.value(*value_id);
                                 let constant = graph.constant_tensor(value);
                                 if let Some(target) = value_row(
                                     ui,
-                                    index,
+                                    &label,
                                     value,
                                     constant,
                                     &self.model.source_dir,
@@ -772,20 +778,21 @@ impl App {
                                 }
                             }
                             None => {
-                                ui.label(RichText::new(format!("{index}.  (omitted)")).weak());
+                                ui.label(RichText::new(format!("{label}  (omitted)")).weak());
                             }
                         }
                     }
 
                     section_heading(ui, "Outputs");
                     for (index, value_id) in node.outputs.iter().enumerate() {
+                        let label = parameter_label(schema.map(|s| s.outputs), index);
                         match value_id {
                             Some(value_id) => {
                                 let value = graph.value(*value_id);
                                 let constant = graph.constant_tensor(value);
                                 if let Some(target) = value_row(
                                     ui,
-                                    index,
+                                    &label,
                                     value,
                                     constant,
                                     &self.model.source_dir,
@@ -795,7 +802,7 @@ impl App {
                                 }
                             }
                             None => {
-                                ui.label(RichText::new(format!("{index}.  (omitted)")).weak());
+                                ui.label(RichText::new(format!("{label}  (omitted)")).weak());
                             }
                         }
                     }
@@ -943,6 +950,16 @@ impl App {
             self.select_node(target, true);
         }
     }
+}
+
+/// Label for one position in an operator's inputs or outputs.
+///
+/// Operators outside the domains the specification covers fall back to the
+/// position itself, which is all the model says about them.
+fn parameter_label(params: Option<&'static [(&'static str, Arity)]>, index: usize) -> String {
+    params
+        .and_then(|params| op_schema::parameter(params, index))
+        .unwrap_or_else(|| format!("{index}."))
 }
 
 /// Draw the button returning to the previously selected item, if there is one.
@@ -1117,7 +1134,7 @@ fn type_color(ui: &Ui) -> Color32 {
 /// the value's name, or a link to its producer or consumer.
 fn value_row(
     ui: &mut Ui,
-    index: usize,
+    label: &str,
     value: &Value,
     constant: Option<&Tensor>,
     base_dir: &Path,
@@ -1126,7 +1143,7 @@ fn value_row(
     let mut target = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        ui.label(RichText::new(format!("{index}.")).weak().monospace());
+        ui.label(RichText::new(label).weak().monospace());
 
         // A constant written out in full says everything its name and type
         // would, so give the space to the value and leave a link for the rest.
